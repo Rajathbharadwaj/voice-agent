@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Agent</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle {
+            color: #888;
+            margin-bottom: 2rem;
+        }
+
+        .container {
+            max-width: 600px;
+            width: 100%;
+        }
+
+        .status-bar {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #666;
+            transition: background 0.3s;
+        }
+
+        .status-dot.connected { background: #00ff88; }
+        .status-dot.recording { background: #ff4444; animation: pulse 1s infinite; }
+        .status-dot.processing { background: #ffaa00; animation: pulse 0.5s infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .status-text {
+            flex: 1;
+            font-size: 0.9rem;
+        }
+
+        .mic-button {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: none;
+            background: linear-gradient(135deg, #00d2ff, #3a7bd5);
+            color: white;
+            font-size: 3rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 2rem auto;
+            transition: transform 0.2s, box-shadow 0.2s;
+            box-shadow: 0 4px 20px rgba(0, 210, 255, 0.3);
+        }
+
+        .mic-button:hover {
+            transform: scale(1.05);
+            box-shadow: 0 6px 30px rgba(0, 210, 255, 0.5);
+        }
+
+        .mic-button:active {
+            transform: scale(0.95);
+        }
+
+        .mic-button.recording {
+            background: linear-gradient(135deg, #ff4444, #cc0000);
+            box-shadow: 0 4px 20px rgba(255, 68, 68, 0.5);
+            animation: pulse-ring 1.5s infinite;
+        }
+
+        @keyframes pulse-ring {
+            0% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 20px rgba(255, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0); }
+        }
+
+        .mic-button:disabled {
+            background: #444;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+
+        .transcript-area {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-top: 1.5rem;
+            min-height: 200px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .message {
+            padding: 0.75rem 1rem;
+            margin-bottom: 0.75rem;
+            border-radius: 12px;
+            max-width: 85%;
+            animation: fadeIn 0.3s;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message.user {
+            background: rgba(0, 210, 255, 0.2);
+            margin-left: auto;
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.agent {
+            background: rgba(255, 255, 255, 0.1);
+            border-bottom-left-radius: 4px;
+        }
+
+        .message.system {
+            background: rgba(255, 170, 0, 0.1);
+            color: #ffaa00;
+            font-size: 0.85rem;
+            text-align: center;
+            max-width: 100%;
+        }
+
+        .message .label {
+            font-size: 0.75rem;
+            color: #888;
+            margin-bottom: 0.25rem;
+        }
+
+        .waveform {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 40px;
+            gap: 3px;
+            margin: 1rem 0;
+        }
+
+        .waveform .bar {
+            width: 4px;
+            background: #00d2ff;
+            border-radius: 2px;
+            animation: wave 0.5s ease-in-out infinite;
+        }
+
+        @keyframes wave {
+            0%, 100% { height: 10px; }
+            50% { height: 30px; }
+        }
+
+        .waveform .bar:nth-child(2) { animation-delay: 0.1s; }
+        .waveform .bar:nth-child(3) { animation-delay: 0.2s; }
+        .waveform .bar:nth-child(4) { animation-delay: 0.3s; }
+        .waveform .bar:nth-child(5) { animation-delay: 0.4s; }
+
+        .hidden { display: none; }
+
+        .instructions {
+            text-align: center;
+            color: #666;
+            font-size: 0.9rem;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>Voice Agent</h1>
+    <p class="subtitle">Local STT + Claude + Local TTS</p>
+
+    <div class="container">
+        <div class="status-bar">
+            <div class="status-dot" id="statusDot"></div>
+            <span class="status-text" id="statusText">Click the microphone to start</span>
+        </div>
+
+        <button class="mic-button" id="micButton" disabled>
+            <span id="micIcon">🎤</span>
+        </button>
+
+        <div class="waveform hidden" id="waveform">
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+        </div>
+
+        <p class="instructions">Hold to record, release to send</p>
+
+        <div class="transcript-area" id="transcriptArea">
+            <!-- Messages will be added here -->
+        </div>
+    </div>
+
+    <script>
+        // Audio configuration
+        const SAMPLE_RATE = 16000;
+        const CHANNELS = 1;
+
+        // DOM elements
+        const micButton = document.getElementById('micButton');
+        const micIcon = document.getElementById('micIcon');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const waveform = document.getElementById('waveform');
+        const transcriptArea = document.getElementById('transcriptArea');
+
+        // State
+        let ws = null;
+        let audioContext = null;
+        let mediaStream = null;
+        let processor = null;
+        let isRecording = false;
+        let audioQueue = [];
+        let isPlaying = false;
+
+        // Initialize
+        async function init() {
+            try {
+                // Request microphone permission
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: SAMPLE_RATE,
+                        channelCount: CHANNELS,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                    }
+                });
+
+                // Create audio context
+                audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+
+                // Connect WebSocket
+                connectWebSocket();
+
+                micButton.disabled = false;
+                updateStatus('Ready', 'connected');
+
+            } catch (err) {
+                console.error('Init error:', err);
+                updateStatus('Microphone access denied', '');
+            }
+        }
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                updateStatus('Connected', 'connected');
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleEvent(data);
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                updateStatus('Disconnected', '');
+                // Reconnect after delay
+                setTimeout(connectWebSocket, 2000);
+            };
+
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+            };
+        }
+
+        function handleEvent(event) {
+            console.log('Event:', event.type, event);
+
+            switch (event.type) {
+                case 'stt_chunk':
+                    // Partial transcript - could show in real-time
+                    break;
+
+                case 'stt_output':
+                    addMessage('user', event.transcript);
+                    updateStatus('Processing...', 'processing');
+                    break;
+
+                case 'agent_chunk':
+                    // Accumulate agent response
+                    appendAgentText(event.text);
+                    break;
+
+                case 'agent_end':
+                    updateStatus('Speaking...', 'processing');
+                    break;
+
+                case 'tool_call':
+                    addMessage('system', `Using tool: ${event.name}`);
+                    break;
+
+                case 'tool_result':
+                    addMessage('system', `Result: ${event.result}`);
+                    break;
+
+                case 'tts_chunk':
+                    // Queue audio for playback
+                    const audioBytes = base64ToBytes(event.audio);
+                    audioQueue.push(audioBytes);
+                    playNextAudio();
+                    break;
+            }
+        }
+
+        let currentAgentMessage = null;
+
+        function appendAgentText(text) {
+            if (!currentAgentMessage) {
+                currentAgentMessage = document.createElement('div');
+                currentAgentMessage.className = 'message agent';
+                currentAgentMessage.innerHTML = '<div class="label">Assistant</div><div class="content"></div>';
+                transcriptArea.appendChild(currentAgentMessage);
+            }
+            currentAgentMessage.querySelector('.content').textContent += text;
+            transcriptArea.scrollTop = transcriptArea.scrollHeight;
+        }
+
+        function addMessage(type, text) {
+            // Reset current agent message
+            if (type === 'user') {
+                currentAgentMessage = null;
+            }
+
+            const msg = document.createElement('div');
+            msg.className = `message ${type}`;
+
+            if (type === 'user') {
+                msg.innerHTML = `<div class="label">You</div><div class="content">${text}</div>`;
+            } else if (type === 'agent') {
+                msg.innerHTML = `<div class="label">Assistant</div><div class="content">${text}</div>`;
+            } else {
+                msg.textContent = text;
+            }
+
+            transcriptArea.appendChild(msg);
+            transcriptArea.scrollTop = transcriptArea.scrollHeight;
+        }
+
+        function base64ToBytes(base64) {
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            return bytes;
+        }
+
+        async function playNextAudio() {
+            if (isPlaying || audioQueue.length === 0) return;
+            isPlaying = true;
+
+            // Combine all queued audio
+            const totalLength = audioQueue.reduce((sum, arr) => sum + arr.length, 0);
+            const combined = new Uint8Array(totalLength);
+            let offset = 0;
+            for (const arr of audioQueue) {
+                combined.set(arr, offset);
+                offset += arr.length;
+            }
+            audioQueue = [];
+
+            // Convert to audio buffer
+            // Assuming 16-bit PCM at 24kHz (Chatterbox default)
+            const TTS_SAMPLE_RATE = 24000;
+            const int16Array = new Int16Array(combined.buffer);
+            const float32Array = new Float32Array(int16Array.length);
+            for (let i = 0; i < int16Array.length; i++) {
+                float32Array[i] = int16Array[i] / 32768;
+            }
+
+            const audioBuffer = audioContext.createBuffer(1, float32Array.length, TTS_SAMPLE_RATE);
+            audioBuffer.getChannelData(0).set(float32Array);
+
+            // Play
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+
+            source.onended = () => {
+                isPlaying = false;
+                updateStatus('Ready', 'connected');
+                if (audioQueue.length > 0) {
+                    playNextAudio();
+                }
+            };
+
+            source.start();
+        }
+
+        function updateStatus(text, state) {
+            statusText.textContent = text;
+            statusDot.className = 'status-dot';
+            if (state) {
+                statusDot.classList.add(state);
+            }
+        }
+
+        // Recording
+        function startRecording() {
+            if (isRecording) return;
+            isRecording = true;
+
+            micButton.classList.add('recording');
+            micIcon.textContent = '⏹️';
+            waveform.classList.remove('hidden');
+            updateStatus('Recording...', 'recording');
+
+            // Create processor node
+            const source = audioContext.createMediaStreamSource(mediaStream);
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+            processor.onaudioprocess = (e) => {
+                if (!isRecording || ws.readyState !== WebSocket.OPEN) return;
+
+                const inputData = e.inputBuffer.getChannelData(0);
+
+                // Convert float32 to int16
+                const int16Data = new Int16Array(inputData.length);
+                for (let i = 0; i < inputData.length; i++) {
+                    const s = Math.max(-1, Math.min(1, inputData[i]));
+                    int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+
+                // Send as binary
+                ws.send(int16Data.buffer);
+            };
+
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+        }
+
+        function stopRecording() {
+            if (!isRecording) return;
+            isRecording = false;
+
+            micButton.classList.remove('recording');
+            micIcon.textContent = '🎤';
+            waveform.classList.add('hidden');
+            updateStatus('Processing...', 'processing');
+
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+        }
+
+        // Event listeners
+        micButton.addEventListener('mousedown', startRecording);
+        micButton.addEventListener('mouseup', stopRecording);
+        micButton.addEventListener('mouseleave', stopRecording);
+
+        // Touch events for mobile
+        micButton.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            startRecording();
+        });
+        micButton.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            stopRecording();
+        });
+
+        // Keyboard shortcut (space bar)
+        document.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' && !e.repeat && document.activeElement !== micButton) {
+                e.preventDefault();
+                startRecording();
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (e.code === 'Space') {
+                e.preventDefault();
+                stopRecording();
+            }
+        });
+
+        // Start
+        init();
+    </script>
+</body>
+</html>
