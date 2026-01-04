@@ -6,10 +6,24 @@ Uses Media Streams for bidirectional audio streaming.
 """
 
 from typing import Optional
+import os
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 
-from ..config import Config
+# Handle import for both package and direct loading
+try:
+    from ..config import Config
+except ImportError:
+    # Create minimal Config when loaded outside package (e.g., LangGraph Platform)
+    from dataclasses import dataclass
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    @dataclass
+    class Config:
+        twilio_account_sid: str = os.environ.get("TWILIO_ACCOUNT_SID", "")
+        twilio_auth_token: str = os.environ.get("TWILIO_AUTH_TOKEN", "")
+        twilio_phone_number: str = os.environ.get("TWILIO_PHONE_NUMBER", "")
 
 
 class TwilioClient:
@@ -88,7 +102,9 @@ class TwilioClient:
         # Add metadata as custom parameters
         if metadata:
             for key, value in metadata.items():
-                stream.parameter(name=key, value=str(value))
+                # Skip None values to avoid passing string "None"
+                if value is not None:
+                    stream.parameter(name=key, value=str(value))
 
         connect.append(stream)
         response.append(connect)
@@ -141,7 +157,9 @@ def generate_media_stream_twiml(websocket_url: str, metadata: Optional[dict] = N
 
     if metadata:
         for key, value in metadata.items():
-            stream.parameter(name=key, value=str(value))
+            # Skip None values to avoid passing string "None"
+            if value is not None:
+                stream.parameter(name=key, value=str(value))
 
     connect.append(stream)
     response.append(connect)

@@ -2,13 +2,18 @@
 SDR Agent Server
 
 FastAPI server for handling Twilio webhooks and media streams.
+Uses LangGraph Platform for agent execution.
 """
 
 import asyncio
+import os
 from typing import Optional
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import FastAPI, WebSocket, Request, Response
 from fastapi.responses import PlainTextResponse, HTMLResponse
+from langgraph_sdk import get_client
 
 from .config import load_config
 from .telephony.media_stream import MediaStreamHandler, StreamSession
@@ -20,6 +25,10 @@ from .agent.tools import set_call_context, CallContext
 from .data.models import Lead, Call
 from .data.database import LeadRepository, CallRepository, CampaignRepository
 from .data.csv_logger import CSVLogger
+from .thread_mapping import get_thread_mapping_service
+
+# LangGraph Platform URL (local dev server)
+LANGGRAPH_URL = os.environ.get("LANGGRAPH_URL", "http://localhost:8123")
 
 
 def create_app() -> FastAPI:
@@ -99,14 +108,13 @@ def create_app() -> FastAPI:
         Handle Twilio media stream WebSocket.
 
         Bidirectional audio streaming for voice calls.
+        Uses LangGraph Platform for agent execution.
         """
-        # Initialize agent
-        agent = SalesAgent(
-            api_key=config.anthropic_api_key,
-            model="claude-opus-4-5-20251101",  # Best quality
-        )
+        # Initialize LangGraph SDK client
+        langgraph_client = get_client(url=LANGGRAPH_URL)
+        print(f"[Server] Connected to LangGraph Platform at {LANGGRAPH_URL}")
 
-        session_data = {"session": None, "agent": agent, "call_session": None}
+        session_data = {"session": None, "langgraph_client": langgraph_client, "call_session": None}
 
         # Store config for hangup functionality
         session_data["config"] = config
@@ -236,7 +244,7 @@ def create_app() -> FastAPI:
                 except Exception as e:
                     print(f"[Server] Error hanging up: {e}")
 
-        # Create audio processor - always use LangChain agent
+        # Create audio processor - uses LangGraph Platform
         async def agent_handler(text: str) -> str:
             call_session = session_data.get("call_session")
             if call_session:
@@ -253,34 +261,97 @@ def create_app() -> FastAPI:
             if is_first_message:
                 session_data["greeting_played"] = True
 
-            # Use LangChain agent for test calls
+            # Use LangGraph Platform for agent execution
             try:
                 # For the first message, add context about which greeting was used
                 input_text = text
                 if is_first_message:
                     session = session_data.get("session")
                     if session and session.owner_name:
-                        # We asked for them by name - agent should use it directly
                         input_text = f"[Context: You asked 'Is {session.owner_name} available?' - you already know their name, use it directly] {text}"
                     else:
-                        # We asked generically - agent should ask for name
                         input_text = f"[Context: You asked 'Am I speaking with the owner or manager?' - you don't know their name yet] {text}"
 
-                response = await agent.process_test_input(input_text)
+                # Get or create thread_id for persistent conversation
+                thread_id = session_data.get("thread_id")
+                if not thread_id:
+                    session = session_data.get("session")
+                    phone = session.to_number if session else None
+
+                    # Always create thread in LangGraph Platform
+                    # For phone calls, we use metadata to track the phone number
+                    thread = await langgraph_client.threads.create(
+                        metadata={"phone": phone} if phone else {}
+                    )
+                    thread_id = thread["thread_id"]
+                    session_data["thread_id"] = thread_id
+                    print(f"[Agent] Created LangGraph thread: {thread_id} (phone: {phone})")
+
+                # Call LangGraph Platform
+                import time as time_module
+                start_time = time_module.time()
+
+                # Use runs.wait() for simpler non-streaming response
+                # Add 30 second timeout to prevent hanging
+                AGENT_TIMEOUT = 30.0  # seconds
+
+                # Pass call context as metadata in config for tools to access
+                call_context = session_data.get("call_context")
+                config_metadata = {}
+                if call_context:
+                    config_metadata = {
+                        "phone_number": call_context.phone_number,
+                        "call_sid": call_context.call_sid,
+                        "business_name": call_context.business_name,
+                        "owner_name": call_context.owner_name,
+                        "lead_id": call_context.lead_id,
+                    }
+
+                try:
+                    result = await asyncio.wait_for(
+                        langgraph_client.runs.wait(
+                            thread_id,
+                            "sales_agent",  # Assistant ID from langgraph.json
+                            input={"messages": [{"role": "human", "content": input_text}]},
+                            config={"configurable": config_metadata} if config_metadata else None,
+                        ),
+                        timeout=AGENT_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"[Agent] LangGraph timeout after {AGENT_TIMEOUT}s")
+                    return "I'm sorry, I had a brief hiccup. Could you say that again?"
+
+                # Extract the last AI message from the result
+                response = ""
+                messages = result.get("messages", [])
+                for msg in reversed(messages):
+                    if isinstance(msg, dict) and msg.get("type") == "ai":
+                        content = msg.get("content", "")
+                        if isinstance(content, str) and content.strip():
+                            response = content
+                            break
+                        elif isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    response = block.get("text", "")
+                                    break
+                            if response:
+                                break
+
+                latency = (time_module.time() - start_time) * 1000
+                print(f"[LATENCY] Agent (LangGraph): {latency:.0f}ms")
 
                 # Check if we should end the call after this response
                 if response and should_end_call(response):
                     session_data["should_hangup"] = True
                     print(f"[Agent] Will hang up after: '{response}'")
-                    # Schedule hangup after TTS finishes (estimate based on response length)
-                    # Roughly 150 words per minute = 2.5 words per second
                     word_count = len(response.split())
-                    tts_duration = max(3.0, word_count / 2.5)  # At least 3 seconds
+                    tts_duration = max(3.0, word_count / 2.5)
                     asyncio.create_task(hangup_after_delay(tts_duration + 1.0))
 
                 return response
             except Exception as e:
-                print(f"[Agent] Error: {e}")
+                print(f"[Agent] LangGraph error: {e}")
                 import traceback
                 traceback.print_exc()
                 return "I'm having a bit of trouble. Could you repeat that?"
@@ -524,8 +595,10 @@ async def on_call_end(session: StreamSession):
     print(f"[Server] Call ended: {session.stream_sid}")
 
 
+# Create app at module level for uvicorn import
+app = create_app()
+
 # For running directly
 if __name__ == "__main__":
     import uvicorn
-    app = create_app()
     uvicorn.run(app, host="0.0.0.0", port=8080)

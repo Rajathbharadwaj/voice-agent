@@ -2,11 +2,13 @@
 Sales Agent
 
 LangChain agent for conducting sales calls.
-Uses Claude as the LLM with sales-specific tools.
+Uses Claude or GPT as the LLM with sales-specific tools.
 Supports PostgreSQL checkpointing for persistent conversation memory.
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()  # Load .env before reading LLM_MODEL
 from typing import Optional
 from datetime import datetime, timedelta
 from langchain.agents import create_agent
@@ -76,12 +78,17 @@ class SalesAgent:
     def __init__(
         self,
         api_key: str,
-        model: str = "claude-sonnet-4-5-20250929",
+        model: str = None,  # Uses LLM_MODEL env var if not specified
         temperature: float = 0.7,
     ):
         self.api_key = api_key
-        self.model_name = model
+        # Use LLM_MODEL env var if model not specified
+        # Examples: "openai:gpt-5.2", "anthropic:claude-opus-4-5-20251101"
+        default_model = "anthropic:claude-opus-4-5-20251101"
+        self.model_name = model or os.environ.get("LLM_MODEL", default_model)
         self.temperature = temperature
+
+        print(f"[SalesAgent] Using model: {self.model_name}")
 
         # Create agent using LangChain's create_agent
         # Inject current date/time into prompt with mini calendar
@@ -102,7 +109,7 @@ class SalesAgent:
         prompt_with_date = f"{SALES_SYSTEM_PROMPT}\n\n{calendar_context}"
 
         self.agent = create_agent(
-            model=model,
+            model=self.model_name,
             tools=SALES_TOOLS,
             system_prompt=prompt_with_date,
             checkpointer=get_checkpointer(),

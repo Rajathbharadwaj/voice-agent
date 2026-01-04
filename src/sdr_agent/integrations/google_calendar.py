@@ -34,6 +34,9 @@ class GoogleCalendarService:
 
     def _get_credentials(self) -> Optional[Credentials]:
         """Get or refresh Google API credentials."""
+        import signal
+        import threading
+
         creds = None
 
         # Load existing token
@@ -41,30 +44,44 @@ class GoogleCalendarService:
             with open(TOKEN_PATH, 'rb') as token:
                 creds = pickle.load(token)
 
-        # Refresh or get new credentials
+        # Refresh or get new credentials with timeout
         if creds and creds.expired and creds.refresh_token:
             try:
-                creds.refresh(Request())
+                # Use threading timeout for refresh (10 second max)
+                refresh_done = threading.Event()
+                refresh_error = [None]
+
+                def refresh_with_timeout():
+                    try:
+                        creds.refresh(Request())
+                    except Exception as e:
+                        refresh_error[0] = e
+                    finally:
+                        refresh_done.set()
+
+                thread = threading.Thread(target=refresh_with_timeout)
+                thread.daemon = True
+                thread.start()
+
+                # Wait max 10 seconds for refresh
+                if not refresh_done.wait(timeout=10.0):
+                    print("[Calendar] Token refresh timed out after 10s")
+                    return None
+
+                if refresh_error[0]:
+                    print(f"[Calendar] Token refresh failed: {refresh_error[0]}")
+                    creds = None
+
             except Exception as e:
-                print(f"[Calendar] Token refresh failed: {e}")
+                print(f"[Calendar] Token refresh error: {e}")
                 creds = None
 
         if not creds or not creds.valid:
-            if not CREDENTIALS_PATH.exists():
-                print(f"[Calendar] No credentials file found at {CREDENTIALS_PATH}")
-                print("[Calendar] Please download OAuth2 credentials from Google Cloud Console")
-                return None
-
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CREDENTIALS_PATH), SCOPES
-            )
-            # Use console flow for headless environments
-            creds = flow.run_local_server(port=8090, open_browser=False)
-
-            # Save for future use
-            with open(TOKEN_PATH, 'wb') as token:
-                pickle.dump(creds, token)
-            print("[Calendar] New credentials saved")
+            # In production/server mode, don't attempt interactive OAuth
+            # Just return None and fall back to mock calendar
+            print("[Calendar] Credentials invalid/expired - use MOCK_CALENDAR=true or run auth script")
+            print("[Calendar] Run: python scripts/auth_google_calendar.py")
+            return None
 
         return creds
 

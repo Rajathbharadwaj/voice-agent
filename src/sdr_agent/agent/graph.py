@@ -6,6 +6,8 @@ Uses PostgreSQL for checkpointing and Redis for pub/sub when deployed via docker
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()  # Load .env before reading LLM_MODEL
 import sys
 import importlib.util
 from datetime import datetime, timedelta
@@ -62,9 +64,14 @@ def build_system_prompt() -> str:
     return f"{SALES_SYSTEM_PROMPT}\n\n{calendar_context}"
 
 
-# Initialize model - uses ANTHROPIC_API_KEY from environment
+# Initialize model - configurable via LLM_MODEL env var
+# Examples: "openai:gpt-5.2", "anthropic:claude-opus-4-5-20251101", "anthropic:claude-sonnet-4-5-20250929"
+DEFAULT_MODEL = "anthropic:claude-opus-4-5-20251101"
+LLM_MODEL = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
+print(f"[LangGraph] Using model: {LLM_MODEL}")
+
 model = init_chat_model(
-    model="anthropic:claude-opus-4-5-20251101",
+    model=LLM_MODEL,
     temperature=0.7,
 )
 

@@ -12,6 +12,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
+
+
+def _get_context_from_config(config: RunnableConfig = None) -> Optional["CallContext"]:
+    """Get call context from RunnableConfig or global fallback."""
+    # First try to get from RunnableConfig (when running through LangGraph Platform)
+    if config and "configurable" in config:
+        cfg = config["configurable"]
+        if cfg.get("phone_number"):
+            return CallContext(
+                call_id=cfg.get("call_sid", ""),
+                lead_id=cfg.get("lead_id", ""),
+                campaign_id="",
+                business_name=cfg.get("business_name", ""),
+                phone_number=cfg.get("phone_number", ""),
+                call_sid=cfg.get("call_sid"),
+                owner_name=cfg.get("owner_name"),
+            )
+    # Fallback to global context (when running directly)
+    return get_call_context()
 
 
 # Helper to load modules directly (avoids package import issues in LangGraph)
@@ -51,59 +71,286 @@ class MockCalendarService:
         return "mock_event_123"
 
 
+class HttpxCalendarService:
+    """Calendar service using httpx directly (bypasses Google SDK recursion in LangGraph)."""
+
+    def __init__(self, access_token: str):
+        self.access_token = access_token
+        self.base_url = "https://www.googleapis.com/calendar/v3"
+
+    def _make_request(self, method: str, endpoint: str, params: dict = None, json_data: dict = None):
+        """Make authenticated request to Google Calendar API."""
+        import httpx
+        url = f"{self.base_url}{endpoint}"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
+        with httpx.Client(timeout=30.0) as client:
+            if method == "GET":
+                response = client.get(url, headers=headers, params=params)
+            elif method == "POST":
+                response = client.post(url, headers=headers, json=json_data, params=params)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+            response.raise_for_status()
+            return response.json()
+
+    def get_available_slots(self, date, slot_duration_minutes=15, start_hour=9, end_hour=17):
+        """Get available time slots for a given date."""
+        from zoneinfo import ZoneInfo
+        local_tz = ZoneInfo('America/Edmonton')
+        day_start = date.replace(hour=start_hour, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+        day_end = date.replace(hour=end_hour, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+
+        try:
+            events_result = self._make_request("GET", "/calendars/primary/events", params={
+                "timeMin": day_start.isoformat(),
+                "timeMax": day_end.isoformat(),
+                "singleEvents": "true",
+                "orderBy": "startTime",
+                "timeZone": "America/Edmonton",
+            })
+            events = events_result.get('items', [])
+            print(f"[Calendar] Found {len(events)} events for {date.strftime('%Y-%m-%d')}")
+        except Exception as e:
+            print(f"[Calendar] Error fetching events: {e}")
+            return []
+
+        # Build busy times
+        busy_times = []
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            end = event['end'].get('dateTime', event['end'].get('date'))
+            if 'T' in start:
+                try:
+                    start_dt = datetime.fromisoformat(start.replace('Z', '+00:00') if start.endswith('Z') else start)
+                    end_dt = datetime.fromisoformat(end.replace('Z', '+00:00') if end.endswith('Z') else end)
+                    busy_start = datetime(start_dt.year, start_dt.month, start_dt.day, start_dt.hour, start_dt.minute, tzinfo=local_tz)
+                    busy_end = datetime(end_dt.year, end_dt.month, end_dt.day, end_dt.hour, end_dt.minute, tzinfo=local_tz)
+                    busy_times.append((busy_start, busy_end))
+                except Exception:
+                    pass
+
+        # Generate available slots
+        available = []
+        current = day_start
+        slot_delta = timedelta(minutes=slot_duration_minutes)
+        while current + slot_delta <= day_end:
+            slot_end = current + slot_delta
+            is_free = all(slot_end <= bs or current >= be for bs, be in busy_times)
+            if is_free:
+                available.append(current)
+            current += slot_delta
+
+        print(f"[Calendar] {len(available)} available slots")
+        return available
+
+    def get_availability_info(self, date, slot_duration_minutes=15, start_hour=9, end_hour=17):
+        """Get both available slots and busy periods for a given date."""
+        from zoneinfo import ZoneInfo
+        local_tz = ZoneInfo('America/Edmonton')
+        day_start = date.replace(hour=start_hour, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+        day_end = date.replace(hour=end_hour, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+
+        try:
+            events_result = self._make_request("GET", "/calendars/primary/events", params={
+                "timeMin": day_start.isoformat(),
+                "timeMax": day_end.isoformat(),
+                "singleEvents": "true",
+                "orderBy": "startTime",
+                "timeZone": "America/Edmonton",
+            })
+            events = events_result.get('items', [])
+        except Exception as e:
+            print(f"[Calendar] Error fetching events: {e}")
+            return {"available": [], "busy": []}
+
+        busy_times = []
+        busy_info = []
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            end = event['end'].get('dateTime', event['end'].get('date'))
+            summary = event.get('summary', 'Busy')
+            if 'T' in start:
+                try:
+                    start_dt = datetime.fromisoformat(start.replace('Z', '+00:00') if start.endswith('Z') else start)
+                    end_dt = datetime.fromisoformat(end.replace('Z', '+00:00') if end.endswith('Z') else end)
+                    busy_start = datetime(start_dt.year, start_dt.month, start_dt.day, start_dt.hour, start_dt.minute, tzinfo=local_tz)
+                    busy_end = datetime(end_dt.year, end_dt.month, end_dt.day, end_dt.hour, end_dt.minute, tzinfo=local_tz)
+                    busy_times.append((busy_start, busy_end))
+                    busy_info.append({
+                        "start": busy_start.strftime("%I:%M %p").lstrip("0"),
+                        "end": busy_end.strftime("%I:%M %p").lstrip("0"),
+                        "title": summary
+                    })
+                except Exception:
+                    pass
+
+        available = []
+        current = day_start
+        slot_delta = timedelta(minutes=slot_duration_minutes)
+        while current + slot_delta <= day_end:
+            slot_end = current + slot_delta
+            is_free = all(slot_end <= bs or current >= be for bs, be in busy_times)
+            if is_free:
+                available.append(current)
+            current += slot_delta
+
+        return {"available": available, "busy": busy_info}
+
+    def create_meeting(self, title, start_time, duration_minutes=15, attendee_email=None, attendee_name=None, description=None):
+        """Create a calendar event."""
+        from zoneinfo import ZoneInfo
+        local_tz = ZoneInfo('America/Edmonton')
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=local_tz)
+        end_time = start_time + timedelta(minutes=duration_minutes)
+
+        event = {
+            'summary': title,
+            'description': description or f"Parallel Universe Demo with {attendee_name or 'Prospect'}",
+            'start': {'dateTime': start_time.isoformat(), 'timeZone': 'America/Edmonton'},
+            'end': {'dateTime': end_time.isoformat(), 'timeZone': 'America/Edmonton'},
+        }
+        if attendee_email:
+            event['attendees'] = [{'email': attendee_email, 'displayName': attendee_name or ''}]
+
+        try:
+            result = self._make_request("POST", "/calendars/primary/events", params={"sendUpdates": "all"}, json_data=event)
+            event_id = result.get('id')
+            print(f"[Calendar] Event created: {result.get('htmlLink')}")
+            return event_id
+        except Exception as e:
+            print(f"[Calendar] Error creating event: {e}")
+            return None
+
+
 def _get_calendar_service():
-    """Get Google Calendar service, loading module directly if needed."""
+    """Get Google Calendar service using httpx (bypasses SDK recursion issues)."""
     import os
+    import pickle
 
     # Use mock if MOCK_CALENDAR is explicitly true
     if os.environ.get("MOCK_CALENDAR", "").lower() in ("true", "1", "yes"):
         print("[Tools] Using mock calendar service")
         return MockCalendarService()
 
+    # Try to load token from pickle file
+    token_path = Path(__file__).parent.parent.parent.parent / "data" / "google_token.pickle"
+    if not token_path.exists():
+        print("[Calendar] No token file found - run: python scripts/auth_google_calendar.py")
+        return MockCalendarService()
+
     try:
-        from ..integrations.google_calendar import get_calendar_service
-        return get_calendar_service()
-    except ImportError:
-        try:
-            tools_dir = Path(__file__).parent
-            integrations_dir = tools_dir.parent / "integrations"
-            calendar_module = _load_module_direct(
-                "_google_calendar",
-                integrations_dir / "google_calendar.py"
-            )
-            return calendar_module.get_calendar_service()
-        except Exception as e:
-            print(f"[Tools] Calendar unavailable, using mock: {e}")
-            return MockCalendarService()
+        with open(token_path, 'rb') as f:
+            creds = pickle.load(f)
+
+        # Check if token is expired
+        if creds.expired:
+            # Try to refresh using httpx directly (bypass google SDK)
+            if creds.refresh_token:
+                import httpx
+                client_id = creds.client_id
+                client_secret = creds.client_secret
+                refresh_token = creds.refresh_token
+
+                try:
+                    with httpx.Client(timeout=10.0) as client:
+                        response = client.post(
+                            "https://oauth2.googleapis.com/token",
+                            data={
+                                "client_id": client_id,
+                                "client_secret": client_secret,
+                                "refresh_token": refresh_token,
+                                "grant_type": "refresh_token",
+                            },
+                        )
+                        response.raise_for_status()
+                        token_data = response.json()
+                        new_access_token = token_data["access_token"]
+                        print("[Calendar] Token refreshed via httpx")
+                        return HttpxCalendarService(new_access_token)
+                except Exception as e:
+                    print(f"[Calendar] Token refresh failed: {e}")
+                    print("[Calendar] Run: python scripts/auth_google_calendar.py")
+                    return MockCalendarService()
+            else:
+                print("[Calendar] Token expired and no refresh token - run auth script")
+                return MockCalendarService()
+
+        # Token is valid, use it directly
+        return HttpxCalendarService(creds.token)
+
+    except Exception as e:
+        print(f"[Calendar] Error loading credentials: {e}")
+        return MockCalendarService()
 
 
 def _get_config():
     """Load config, handling import issues."""
+    import os
+    from dataclasses import dataclass
+    from dotenv import load_dotenv
+
     try:
         from ..config import load_config
         return load_config()
     except ImportError:
-        tools_dir = Path(__file__).parent
-        config_module = _load_module_direct(
-            "_config",
-            tools_dir.parent / "config.py"
-        )
-        return config_module.load_config()
+        # Create minimal config when loaded outside package
+        load_dotenv()
+
+        @dataclass
+        class MinimalConfig:
+            twilio_account_sid: str = os.environ.get("TWILIO_ACCOUNT_SID", "")
+            twilio_auth_token: str = os.environ.get("TWILIO_AUTH_TOKEN", "")
+            twilio_phone_number: str = os.environ.get("TWILIO_PHONE_NUMBER", "")
+
+        return MinimalConfig()
 
 
 def _get_twilio_client():
     """Get Twilio client, handling import issues."""
+    import os
+
     try:
         from ..telephony.twilio_client import TwilioClient
         return TwilioClient
     except ImportError:
-        tools_dir = Path(__file__).parent
-        telephony_dir = tools_dir.parent / "telephony"
-        twilio_module = _load_module_direct(
-            "_twilio_client",
-            telephony_dir / "twilio_client.py"
-        )
-        return twilio_module.TwilioClient
+        # Create minimal TwilioClient using httpx directly (avoids SDK recursion in LangGraph)
+        from dotenv import load_dotenv
+        import httpx
+        import base64
+        load_dotenv()
+
+        class MinimalTwilioClient:
+            def __init__(self, config=None):
+                self.account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
+                self.auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+                self.from_number = os.environ.get("TWILIO_PHONE_NUMBER", "")
+
+            def send_sms(self, to_number: str, message: str):
+                """Send SMS via Twilio REST API directly (bypasses SDK)."""
+                url = f"https://api.twilio.com/2010-04-01/Accounts/{self.account_sid}/Messages.json"
+                auth = base64.b64encode(f"{self.account_sid}:{self.auth_token}".encode()).decode()
+
+                with httpx.Client(timeout=30.0) as client:
+                    response = client.post(
+                        url,
+                        headers={
+                            "Authorization": f"Basic {auth}",
+                            "Content-Type": "application/x-www-form-urlencoded",
+                        },
+                        data={
+                            "To": to_number,
+                            "From": self.from_number,
+                            "Body": message,
+                        },
+                    )
+                    response.raise_for_status()
+                    return response.json()
+
+        return MinimalTwilioClient
 
 
 def _create_pending_booking(*args, **kwargs):
@@ -243,6 +490,7 @@ def book_meeting(
     time: str,
     contact_name: str,
     contact_email: str,
+    config: RunnableConfig = None,
 ) -> str:
     """
     Book a discovery meeting with the prospect.
@@ -258,7 +506,7 @@ def book_meeting(
     Returns:
         Confirmation message
     """
-    context = get_call_context()
+    context = _get_context_from_config(config)
     if not context:
         return "Error: No active call context"
 
@@ -314,6 +562,7 @@ def request_callback(
     day: str,
     time: str,
     reason: Optional[str] = None,
+    config: RunnableConfig = None,
 ) -> str:
     """
     Schedule a callback when the prospect asks to be called back later.
@@ -328,7 +577,7 @@ def request_callback(
     Returns:
         Confirmation message
     """
-    context = get_call_context()
+    context = _get_context_from_config(config)
     if not context:
         return "Error: No active call context"
 
@@ -345,6 +594,7 @@ def request_callback(
 def end_call(
     outcome: str,
     notes: Optional[str] = None,
+    config: RunnableConfig = None,
 ) -> str:
     """
     End the current call and record the outcome.
@@ -367,7 +617,7 @@ def end_call(
     Returns:
         Confirmation that the call has ended
     """
-    context = get_call_context()
+    context = _get_context_from_config(config)
     if not context:
         return "Error: No active call context"
 
@@ -393,6 +643,7 @@ def send_booking_link(
     day: str,
     time: str,
     contact_name: str,
+    config: RunnableConfig = None,
 ) -> str:
     """
     Send a booking link via SMS instead of collecting email over the phone.
@@ -415,7 +666,7 @@ def send_booking_link(
     import os
     import httpx
 
-    context = get_call_context()
+    context = _get_context_from_config(config)
     if not context:
         return "Error: No active call context"
 
@@ -477,7 +728,9 @@ def send_booking_link(
 
     except Exception as e:
         print(f"[Tools] SMS error: {e}")
-        return "I had trouble sending the link. Let me get your email instead."
+        import traceback
+        traceback.print_exc()
+        return "Technical issue sending SMS. Apologize and offer to email the booking link instead - ask for their email and use add_note to save it."
 
     return f"Booking link sent! Tell them to check their phone, and remind them it might go to spam or promotions on iPhone."
 
@@ -533,13 +786,15 @@ def _send_booking_link_local(
 
     except Exception as e:
         print(f"[Tools] SMS error in local fallback: {e}")
-        return "I had trouble sending the link. Let me get your email instead."
+        import traceback
+        traceback.print_exc()
+        return "Technical issue sending SMS. Apologize and offer to email the booking link instead - ask for their email and use add_note to save it."
 
     return f"Booking link sent! Tell them to check their phone, and remind them it might go to spam or promotions on iPhone."
 
 
 @tool
-def add_note(note: str) -> str:
+def add_note(note: str, config: RunnableConfig = None) -> str:
     """
     Add a note about something important mentioned in the call.
 
@@ -555,7 +810,7 @@ def add_note(note: str) -> str:
     Returns:
         Confirmation
     """
-    context = get_call_context()
+    context = _get_context_from_config(config)
     if not context:
         return "Error: No active call context"
 

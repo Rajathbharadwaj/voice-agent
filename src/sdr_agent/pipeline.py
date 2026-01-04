@@ -10,9 +10,44 @@ The media stream handler converts mulaw ↔ PCM, so this pipeline works with PCM
 import asyncio
 import struct
 import math
+import time
+import collections
 from typing import AsyncIterator, Optional, Callable, Awaitable, Union
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# VAD States (Vapi-style)
+VAD_SILENCE = 0
+VAD_STARTING = 1
+VAD_SPEAKING = 2
+VAD_STOPPING = 3
+
+
+def calculate_rms(audio_chunk: bytes) -> float:
+    """Calculate RMS (root mean square) of PCM audio chunk."""
+    if len(audio_chunk) < 2:
+        return 0.0
+    # Unpack 16-bit PCM samples
+    try:
+        samples = struct.unpack(f'<{len(audio_chunk)//2}h', audio_chunk)
+        if not samples:
+            return 0.0
+        # Calculate RMS
+        sum_squares = sum(s * s for s in samples)
+        return math.sqrt(sum_squares / len(samples))
+    except struct.error:
+        return 0.0
+
+
+def get_adaptive_threshold(audio_levels: collections.deque, multiplier: float = 1.5) -> float:
+    """Get adaptive VAD threshold based on 85th percentile of recent audio levels."""
+    if len(audio_levels) < 50:  # Need at least 1 second of audio
+        return 500  # Default threshold
+    sorted_levels = sorted(audio_levels)
+    p85_idx = int(len(sorted_levels) * 0.85)
+    baseline = sorted_levels[p85_idx]
+    # Threshold is baseline * multiplier, with min/max bounds
+    return max(300, min(baseline * multiplier, 2000))
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -255,6 +290,7 @@ class InteractivePipeline:
         self._speaking = False
         self._audio_output_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self._transcript_buffer: list[str] = []
+        self._greeting_cooldown_until = 0  # Timestamp when greeting cooldown ends
 
         # Initialize turn detector for smarter end-of-utterance detection
         from turn_detector import get_turn_detector
@@ -303,8 +339,6 @@ class InteractivePipeline:
         tts_task = asyncio.create_task(self._tts_loop())
 
         # Send initial greeting if configured (for outbound calls)
-        # Track when greeting finishes to ignore echo
-        greeting_cooldown_until = 0
         GREETING_ECHO_COOLDOWN = 3.0  # Ignore STT for this long after greeting starts
 
         if self.initial_greeting:
@@ -321,18 +355,83 @@ class InteractivePipeline:
                 self._turn_detector.add_agent_message(greeting)
                 if self.on_response:
                     await self.on_response(greeting)
-                await self.tts.send_text(greeting)
-                # Set cooldown to ignore echo from greeting
-                greeting_cooldown_until = asyncio.get_event_loop().time() + GREETING_ECHO_COOLDOWN
+                # Set cooldown BEFORE sending TTS to catch any echo
+                self._greeting_cooldown_until = time.time() + GREETING_ECHO_COOLDOWN
                 print(f"[Pipeline] Greeting echo cooldown active for {GREETING_ECHO_COOLDOWN}s")
+                await self.tts.send_text(greeting)
 
-        # Task to feed audio to STT
+        # VAD configuration (Vapi-style)
+        VAD_INTERRUPT_DURATION = 0.2   # 200ms of voice to trigger interrupt
+        VAD_CHUNK_DURATION = 0.02      # 20ms per chunk (at 16kHz)
+
+        # Task to feed audio to STT with VAD-based interrupt detection
         async def feed_stt():
+            # VAD state
+            vad_state = VAD_SILENCE
+            voice_start_time = 0
+            audio_levels = collections.deque(maxlen=1500)  # 30s rolling window
+            vad_triggered = False
+
             try:
                 async for audio_chunk in audio_input:
                     if not self._running:
                         break
+
+                    current_time = time.time()
+
+                    # Calculate RMS for this chunk
+                    rms = calculate_rms(audio_chunk)
+                    audio_levels.append(rms)
+
+                    # Get adaptive threshold
+                    threshold = get_adaptive_threshold(audio_levels)
+
+                    # Skip VAD during greeting cooldown (prevents echo triggering)
+                    in_cooldown = self._greeting_cooldown_until > 0 and current_time < self._greeting_cooldown_until
+
+                    # Only run VAD if agent is speaking and not in cooldown
+                    if self._speaking and not in_cooldown:
+                        # VAD State Machine
+                        if vad_state == VAD_SILENCE:
+                            if rms > threshold:
+                                vad_state = VAD_STARTING
+                                voice_start_time = current_time
+
+                        elif vad_state == VAD_STARTING:
+                            if rms > threshold:
+                                # Check if voice duration exceeds interrupt threshold
+                                voice_duration = current_time - voice_start_time
+                                if voice_duration >= VAD_INTERRUPT_DURATION:
+                                    vad_state = VAD_SPEAKING
+                                    if not vad_triggered:
+                                        vad_triggered = True
+                                        print(f"[VAD] Interrupt detected! Voice for {voice_duration*1000:.0f}ms (threshold: {threshold:.0f})")
+                                        # Trigger interrupt immediately - don't wait for STT
+                                        await self._handle_interrupt()
+                                        self._speaking = False
+                            else:
+                                # Voice stopped before threshold - false start
+                                vad_state = VAD_SILENCE
+
+                        elif vad_state == VAD_SPEAKING:
+                            if rms < threshold:
+                                vad_state = VAD_STOPPING
+
+                        elif vad_state == VAD_STOPPING:
+                            if rms > threshold:
+                                vad_state = VAD_SPEAKING
+                            else:
+                                vad_state = VAD_SILENCE
+                                vad_triggered = False
+
+                    elif not self._speaking:
+                        # Reset VAD state when agent isn't speaking
+                        vad_state = VAD_SILENCE
+                        vad_triggered = False
+
+                    # Always send audio to STT
                     await self.stt.add_audio(audio_chunk)
+
                 await self.stt.close()
             except Exception as e:
                 print(f"[Pipeline] Audio input error: {e}")
@@ -386,9 +485,6 @@ class InteractivePipeline:
         SHORT_INPUT_THRESHOLD = 4      # Word count for "short input" fast-track
         SHORT_INPUT_EOT_THRESHOLD = 0.15  # Lower EOT threshold for short inputs (names, "yes", etc.)
         NO_INPUT_TIMEOUT = 5.0         # Seconds of silence before "are you there?"
-        VAD_INTERRUPT_THRESHOLD = 500  # RMS threshold for voice activity detection (interrupt)
-        GREETING_ECHO_COOLDOWN = 3.0   # Ignore STT for this long after initial greeting
-        greeting_cooldown_until = 0    # Timestamp when greeting cooldown ends
 
         # Track when agent last spoke (for "are you there?" fallback)
         # Timer only starts when TTS finishes playing (_speaking becomes False)
@@ -548,7 +644,7 @@ class InteractivePipeline:
                     current_time = time.time()
 
                     # Skip transcripts during greeting echo cooldown
-                    if greeting_cooldown_until > 0 and asyncio.get_event_loop().time() < greeting_cooldown_until:
+                    if self._greeting_cooldown_until > 0 and current_time < self._greeting_cooldown_until:
                         print(f"[Pipeline] Ignoring echo during greeting cooldown: {transcript}")
                         continue
 
