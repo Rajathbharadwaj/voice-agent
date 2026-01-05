@@ -2,6 +2,8 @@
 
 Start all services for the voice agent: PostgreSQL, Redis, and LangGraph dev server.
 
+> **Note**: If you've updated `.env` (e.g., NGROK_URL changed), use `/restart-servers` instead to force a fresh restart and pick up the new values.
+
 ## Steps
 
 1. Start Docker containers (PostgreSQL + Redis) if not running
