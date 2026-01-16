@@ -16,12 +16,14 @@ dependencies = [
     "langchain-core>=0.3.0",
     "langgraph>=0.2.0",
     "langgraph-checkpoint-postgres>=2.0.0",
-    "langgraph-checkpoint-redis>=1.0.0",
+    "langgraph-checkpoint-redis>=0.3.0",
     "soundfile>=0.13.0",
     "numpy>=1.24.0",
     "torch>=2.0.0",
     "torchaudio>=2.0.0",
     "chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git",
+    # Orpheus TTS with vLLM (comment out chatterbox-tts if conflicts occur)
+    # "orpheus-speech>=0.1.0",
     # SDR Agent dependencies
     "twilio>=9.0.0",
     "selenium>=4.15.0",

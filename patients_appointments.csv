@@ -1,0 +1,6 @@
+patient_name,phone,appointment_date,appointment_time,provider_name,clinic_name,appointment_type
+John Smith,+19029310062,January 17 2026,2:30 PM,Dr. Williams,Downtown Medical Center,Annual checkup
+Jane Doe,+14032661212,January 18 2026,10:00 AM,Dr. Chen,Riverside Clinic,Follow-up visit
+Michael Johnson,+14035551234,January 20 2026,3:15 PM,Dr. Patel,Sunrise Health Center,Lab results review
+Sarah Williams,+14035555678,January 21 2026,9:00 AM,Dr. Thompson,Family Care Clinic,Physical examination
+Robert Brown,+14035559012,January 22 2026,11:30 AM,Dr. Anderson,Metro Medical Group,Consultation

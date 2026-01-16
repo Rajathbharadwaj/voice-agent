@@ -76,7 +76,7 @@ class PipelineConfig:
     silence_duration: float = 1.0  # Respond faster after silence
 
     # TTS settings
-    # "comfyui" (fast ~1s via ComfyUI) or "kokoro" (~600ms) or "mira" (voice ref) or "chatterbox" (slow)
+    # "orpheus" (fastest ~100-200ms via vLLM) or "comfyui" (~1s) or "kokoro" (~600ms) or "mira" (voice ref) or "chatterbox" (slow)
     tts_engine: str = "comfyui"
     tts_voice: str = "am_adam"  # Kokoro voice (not used by mira)
     tts_model_path: Optional[Path] = None
@@ -87,7 +87,20 @@ class PipelineConfig:
 
 def create_tts(config: PipelineConfig):
     """Create TTS engine based on config."""
-    if config.tts_engine == "comfyui":
+    if config.tts_engine == "orpheus":
+        from orpheus_engine import StreamingOrpheusTTS
+        # Map common voice names to Orpheus voices
+        voice_map = {
+            "am_adam": "leo",      # Male professional
+            "af_sarah": "tara",    # Female warm
+            "default": "tara",
+        }
+        voice = voice_map.get(config.tts_voice, config.tts_voice)
+        return StreamingOrpheusTTS(
+            voice=voice,
+            chunk_duration_ms=config.chunk_duration_ms,
+        )
+    elif config.tts_engine == "comfyui":
         from comfyui_tts import StreamingComfyUITTS
         return StreamingComfyUITTS(
             chunk_duration_ms=config.chunk_duration_ms,

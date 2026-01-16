@@ -18,8 +18,8 @@ import soundfile as sf
 from events import STTOutputEvent, STTEvent
 
 # Default paths - can be overridden
-DEFAULT_WHISPER_CLI = Path("/home/rajathdb/ASR/whisper.cpp/build/bin/whisper-cli")
-DEFAULT_WHISPER_MODEL = Path("/home/rajathdb/ASR/whisper.cpp/models/ggml-medium.en.bin")  # medium is more accurate
+DEFAULT_WHISPER_CLI = Path("/home/rajathdb/ASR/push-to-talk-stt/whisper.cpp/build/bin/whisper-cli")
+DEFAULT_WHISPER_MODEL = Path("/home/rajathdb/ASR/push-to-talk-stt/whisper.cpp/models/ggml-base.en.bin")  # base.en fits alongside Orpheus TTS on GPU
 
 
 class WhisperSTT:
@@ -110,7 +110,17 @@ class WhisperSTT:
         try:
             sf.write(temp_file, audio_array, self.sample_rate)
 
-            # Run whisper.cpp
+            # Set up environment with CUDA library paths
+            whisper_dir = self.whisper_cli.parent.parent
+            env = os.environ.copy()
+            cuda_lib_paths = [
+                str(whisper_dir / "ggml" / "src"),
+                str(whisper_dir / "ggml" / "src" / "ggml-cuda"),
+            ]
+            existing_ld = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = ":".join(cuda_lib_paths + ([existing_ld] if existing_ld else []))
+
+            # Run whisper.cpp with CUDA
             result = await asyncio.to_thread(
                 subprocess.run,
                 [
@@ -118,18 +128,24 @@ class WhisperSTT:
                     "-m", str(self.whisper_model),
                     "-f", temp_file,
                     "-nt",  # No timestamps
-                    "-fa",  # Flash attention
+                    "-fa",  # Flash attention (GPU)
                     "--entropy-thold", "2.4",
                     "-ml", "1",  # Max segment length
                 ],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=30
+                timeout=30,
+                env=env,
             )
             transcript = result.stdout.strip()
             latency = (time.time() - start_time) * 1000
-            print(f"[LATENCY] STT (Whisper): {latency:.0f}ms for {duration:.1f}s audio")
+
+            # Log GPU usage from stderr
+            stderr_out = result.stderr or ""
+            gpu_used = "use gpu    = 1" in stderr_out or "CUDA" in stderr_out
+            print(f"[LATENCY] STT (Whisper): {latency:.0f}ms for {duration:.1f}s audio {'(GPU)' if gpu_used else '(CPU)'}")
+
             return transcript
         except Exception as e:
             print(f"Transcription error: {e}")

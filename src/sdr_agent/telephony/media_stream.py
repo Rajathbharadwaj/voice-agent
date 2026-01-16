@@ -25,9 +25,14 @@ class StreamSession:
     lead_id: Optional[str] = None
     campaign_id: Optional[str] = None
     business_name: Optional[str] = None
-    owner_name: Optional[str] = None   # Lead's owner/decision-maker name
+    owner_name: Optional[str] = None   # Lead's owner/decision-maker name (also used as patient_name)
     from_number: Optional[str] = None  # Caller's phone number
     to_number: Optional[str] = None    # Called phone number
+    # Healthcare-specific fields
+    appointment_date: Optional[str] = None
+    appointment_time: Optional[str] = None
+    provider_name: Optional[str] = None
+    appointment_type: Optional[str] = None
 
 
 class MediaStreamHandler:
@@ -104,6 +109,11 @@ class MediaStreamHandler:
                         session.owner_name = custom_params.get("owner_name")
                         session.from_number = custom_params.get("from_number")
                         session.to_number = custom_params.get("to_number")
+                        # Healthcare-specific parameters
+                        session.appointment_date = custom_params.get("appointment_date")
+                        session.appointment_time = custom_params.get("appointment_time")
+                        session.provider_name = custom_params.get("provider_name")
+                        session.appointment_type = custom_params.get("appointment_type")
 
                         print(f"[MediaStream] Stream started: {session.stream_sid}")
 

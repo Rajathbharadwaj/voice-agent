@@ -1,7 +1,8 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "sales_agent": "./src/sdr_agent/agent/graph.py:graph"
+    "sales_agent": "./src/sdr_agent/agent/graph.py:graph",
+    "healthcare_agent": "./src/sdr_agent/agent/graph_healthcare.py:graph"
   },
   "env": ".env"
 }

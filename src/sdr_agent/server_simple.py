@@ -211,8 +211,8 @@ async def transcribe_audio(audio_buffer: list) -> str:
         sf.write(temp_file, audio_array, STT_SAMPLE_RATE)
 
         # Run whisper.cpp
-        whisper_cli = "/home/rajathdb/ASR/whisper.cpp/build/bin/whisper-cli"
-        whisper_model = "/home/rajathdb/ASR/whisper.cpp/models/ggml-medium.en.bin"
+        whisper_cli = "/home/rajathdb/ASR/push-to-talk-stt/whisper.cpp/build/bin/whisper-cli"
+        whisper_model = "/home/rajathdb/ASR/push-to-talk-stt/whisper.cpp/models/ggml-medium.en.bin"
 
         result = await asyncio.to_thread(
             subprocess.run,

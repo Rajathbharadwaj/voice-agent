@@ -22,13 +22,17 @@ from .pipeline import create_audio_processor, PipelineConfig
 
 from .agent.sales_agent import SalesAgent, CallSession
 from .agent.tools import set_call_context, CallContext
-from .data.models import Lead, Call
+from .agent.tools_healthcare import set_healthcare_call_context, HealthcareCallContext
+from .data.models import Lead, Call, PatientAppointment
 from .data.database import LeadRepository, CallRepository, CampaignRepository
 from .data.csv_logger import CSVLogger
 from .thread_mapping import get_thread_mapping_service
 
 # LangGraph Platform URL (local dev server)
 LANGGRAPH_URL = os.environ.get("LANGGRAPH_URL", "http://localhost:8123")
+
+# Agent mode: "sales" or "healthcare"
+AGENT_MODE = os.environ.get("AGENT_MODE", "sales")
 
 
 def create_app() -> FastAPI:
@@ -51,6 +55,27 @@ def create_app() -> FastAPI:
     async def health():
         """Health check endpoint."""
         return {"status": "ok", "service": "sdr-agent"}
+
+    @app.on_event("startup")
+    async def startup_warmup():
+        """Warm up TTS model on server start to avoid delay on first call."""
+        import sys
+        tts_engine = os.getenv("TTS_ENGINE", "comfyui")
+        print(f"[Server] TTS engine: {tts_engine}", flush=True)
+        if tts_engine == "orpheus":
+            print("[Server] Warming up Orpheus TTS model (this takes ~20s)...", flush=True)
+            try:
+                from orpheus_engine import OrpheusTTS
+                tts = OrpheusTTS()
+                # Load model in background thread
+                await asyncio.to_thread(tts._load_model)
+                print("[Server] Orpheus TTS model warmed up and ready!", flush=True)
+            except Exception as e:
+                import traceback
+                print(f"[Server] Warning: Failed to warm up Orpheus: {e}", flush=True)
+                traceback.print_exc()
+        else:
+            print(f"[Server] Using TTS engine: {tts_engine} (no warmup needed)", flush=True)
 
     @app.post("/warmup")
     async def warmup():
@@ -84,6 +109,11 @@ def create_app() -> FastAPI:
         campaign_id = request.query_params.get("campaign_id")
         business_name = request.query_params.get("business_name")
         owner_name = request.query_params.get("owner_name")
+        # Healthcare-specific parameters
+        appointment_date = request.query_params.get("appointment_date")
+        appointment_time = request.query_params.get("appointment_time")
+        provider_name = request.query_params.get("provider_name")
+        appointment_type = request.query_params.get("appointment_type")
 
         # Generate TwiML for media stream
         websocket_url = f"wss://{request.headers.get('host', 'localhost')}/media-stream"
@@ -97,6 +127,11 @@ def create_app() -> FastAPI:
                 "owner_name": owner_name,
                 "from_number": from_number,
                 "to_number": to_number,
+                # Healthcare-specific metadata
+                "appointment_date": appointment_date,
+                "appointment_time": appointment_time,
+                "provider_name": provider_name,
+                "appointment_type": appointment_type,
             }
         )
 
@@ -130,27 +165,45 @@ def create_app() -> FastAPI:
             session_data["session"] = session
             session_data["call_sid"] = session.call_sid  # Store for hangup
             print(f"[Server] Call started: {session.call_sid}")
+            print(f"[Server] Agent mode: {AGENT_MODE}")
 
             # Register in active_sessions for webhook access
             if session.call_sid:
                 active_sessions[session.call_sid] = session_data
                 print(f"[Server] Registered session: {session.call_sid}")
 
-            # Set up call context for tools (even for test calls)
-            # This allows tools like book_meeting and request_callback to work
-            # For outbound calls, to_number is the prospect's phone number
-            context = CallContext(
-                call_id=session.call_sid or "test_call",
-                lead_id=session.lead_id or "test_lead",
-                campaign_id=session.campaign_id or "test_campaign",
-                business_name=session.business_name or "Test Business",
-                phone_number=session.to_number or "+15551234567",  # Prospect's phone
-                call_sid=session.call_sid,  # Twilio call SID for booking API
-                owner_name=getattr(session, 'owner_name', None),  # Lead's owner name
-            )
-            set_call_context(context)
-            session_data["call_context"] = context
-            print(f"[Server] Call context set: {context.phone_number}")
+            if AGENT_MODE == "healthcare":
+                # Set up healthcare call context using session fields
+                healthcare_context = HealthcareCallContext(
+                    call_id=session.call_sid or "test_call",
+                    patient_name=session.owner_name or "Patient",  # owner_name holds patient name
+                    phone_number=session.to_number or "+15551234567",
+                    appointment_date=session.appointment_date or "January 17, 2026",
+                    appointment_time=session.appointment_time or "2:30 PM",
+                    provider_name=session.provider_name or "Dr. Williams",
+                    clinic_name=session.business_name or "Downtown Medical Center",  # business_name holds clinic
+                    appointment_type=session.appointment_type or "Appointment",
+                    call_sid=session.call_sid,
+                )
+                set_healthcare_call_context(healthcare_context)
+                session_data["healthcare_context"] = healthcare_context
+                print(f"[Server] Healthcare context set: {healthcare_context.patient_name} - {healthcare_context.appointment_date} at {healthcare_context.appointment_time}")
+            else:
+                # Set up sales call context for tools (even for test calls)
+                # This allows tools like book_meeting and request_callback to work
+                # For outbound calls, to_number is the prospect's phone number
+                context = CallContext(
+                    call_id=session.call_sid or "test_call",
+                    lead_id=session.lead_id or "test_lead",
+                    campaign_id=session.campaign_id or "test_campaign",
+                    business_name=session.business_name or "Test Business",
+                    phone_number=session.to_number or "+15551234567",  # Prospect's phone
+                    call_sid=session.call_sid,  # Twilio call SID for booking API
+                    owner_name=getattr(session, 'owner_name', None),  # Lead's owner name
+                )
+                set_call_context(context)
+                session_data["call_context"] = context
+                print(f"[Server] Call context set: {context.phone_number}")
 
             # Get lead info
             lead = None
@@ -296,22 +349,38 @@ def create_app() -> FastAPI:
                 AGENT_TIMEOUT = 30.0  # seconds
 
                 # Pass call context as metadata in config for tools to access
-                call_context = session_data.get("call_context")
                 config_metadata = {}
-                if call_context:
-                    config_metadata = {
-                        "phone_number": call_context.phone_number,
-                        "call_sid": call_context.call_sid,
-                        "business_name": call_context.business_name,
-                        "owner_name": call_context.owner_name,
-                        "lead_id": call_context.lead_id,
-                    }
+                if AGENT_MODE == "healthcare":
+                    healthcare_context = session_data.get("healthcare_context")
+                    if healthcare_context:
+                        config_metadata = {
+                            "phone_number": healthcare_context.phone_number,
+                            "call_sid": healthcare_context.call_sid,
+                            "patient_name": healthcare_context.patient_name,
+                            "appointment_date": healthcare_context.appointment_date,
+                            "appointment_time": healthcare_context.appointment_time,
+                            "provider_name": healthcare_context.provider_name,
+                            "clinic_name": healthcare_context.clinic_name,
+                            "appointment_type": healthcare_context.appointment_type,
+                        }
+                    agent_id = "healthcare_agent"
+                else:
+                    call_context = session_data.get("call_context")
+                    if call_context:
+                        config_metadata = {
+                            "phone_number": call_context.phone_number,
+                            "call_sid": call_context.call_sid,
+                            "business_name": call_context.business_name,
+                            "owner_name": call_context.owner_name,
+                            "lead_id": call_context.lead_id,
+                        }
+                    agent_id = "sales_agent"
 
                 try:
                     result = await asyncio.wait_for(
                         langgraph_client.runs.wait(
                             thread_id,
-                            "sales_agent",  # Assistant ID from langgraph.json
+                            agent_id,  # Agent ID based on AGENT_MODE
                             input={"messages": [{"role": "human", "content": input_text}]},
                             config={"configurable": config_metadata} if config_metadata else None,
                         ),
@@ -366,12 +435,29 @@ def create_app() -> FastAPI:
                 await asyncio.sleep(0.05)
 
             session = session_data.get("session")
-            if session and session.owner_name:
-                # We know the owner's name - greet them directly
-                return f"Hi {session.owner_name}! This is Alex, an AI assistant from Parallel Universe. Is this a good time to talk? I just need about 3 minutes."
+
+            if AGENT_MODE == "healthcare":
+                # Healthcare greeting - reference appointment details
+                healthcare_ctx = session_data.get("healthcare_context")
+                if healthcare_ctx:
+                    return (
+                        f"Hi {healthcare_ctx.patient_name}, this is Sarah calling from {healthcare_ctx.clinic_name} "
+                        f"about your upcoming appointment with {healthcare_ctx.provider_name} "
+                        f"on {healthcare_ctx.appointment_date} at {healthcare_ctx.appointment_time}. "
+                        f"Is this a good time?"
+                    )
+                else:
+                    # Fallback healthcare greeting
+                    patient_name = getattr(session, 'owner_name', None) or "there"
+                    return f"Hi {patient_name}, this is Sarah calling from your healthcare provider about your upcoming appointment. Is this a good time?"
             else:
-                # Don't know the owner - use generic opener
-                return "Hi there! This is Alex, an AI assistant from Parallel Universe. Is this a good time to talk? I just need about 3 minutes."
+                # Sales greeting
+                if session and session.owner_name:
+                    # We know the owner's name - greet them directly
+                    return f"Hi {session.owner_name}! This is Alex, an AI assistant from Parallel Universe. Is this a good time to talk? I just need about 3 minutes."
+                else:
+                    # Don't know the owner - use generic opener
+                    return "Hi there! This is Alex, an AI assistant from Parallel Universe. Is this a good time to talk? I just need about 3 minutes."
 
         async def handle_interrupt():
             """Called when user interrupts - clear Twilio audio buffer."""
@@ -381,9 +467,15 @@ def create_app() -> FastAPI:
                 print(f"[Server] Sending clear to Twilio (stream: {session.stream_sid})")
                 await handler.send_clear(ws, session.stream_sid)
 
+        # Create pipeline config with TTS engine from environment
+        pipeline_config = PipelineConfig(
+            tts_engine=os.getenv("TTS_ENGINE", "comfyui"),
+        )
+        print(f"[Server] Using TTS engine: {pipeline_config.tts_engine}")
+
         audio_processor = create_audio_processor(
             agent_handler=agent_handler,
-            config=PipelineConfig(),
+            config=pipeline_config,
             on_interrupt=handle_interrupt,
             initial_greeting=get_greeting,  # Async callable for dynamic greeting
         )
