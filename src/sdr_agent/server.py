@@ -237,11 +237,21 @@ def create_app() -> FastAPI:
                 del active_sessions[session.call_sid]
                 print(f"[Server] Unregistered session: {session.call_sid}")
 
+            # Log healthcare call outcome to CSV
+            healthcare_context = session_data.get("healthcare_context")
+            if healthcare_context:
+                from .data.csv_logger import log_healthcare_call
+                try:
+                    log_file = log_healthcare_call(healthcare_context)
+                    print(f"[Server] Healthcare call logged to: {log_file}")
+                except Exception as e:
+                    print(f"[Server] Error logging healthcare call: {e}")
+
             call_session = session_data.get("call_session")
             if call_session:
                 completed_call = call_session.end()
 
-                # Log to CSV
+                # Log to CSV (sales calls)
                 if session.campaign_id:
                     lead = LeadRepository.get(session.lead_id)
                     if lead:
