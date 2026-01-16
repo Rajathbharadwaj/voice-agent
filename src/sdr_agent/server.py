@@ -417,11 +417,44 @@ def create_app() -> FastAPI:
                             if response:
                                 break
 
+                # Check for end_call tool and extract outcome
+                for msg in messages:
+                    if isinstance(msg, dict) and msg.get("type") == "ai":
+                        tool_calls = msg.get("tool_calls", [])
+                        for tc in tool_calls:
+                            if tc.get("name") == "end_call":
+                                args = tc.get("args", {})
+                                outcome = args.get("outcome", "unknown")
+                                notes = args.get("notes", "")
+                                # Update healthcare context with outcome
+                                healthcare_ctx = session_data.get("healthcare_context")
+                                if healthcare_ctx:
+                                    healthcare_ctx.outcome = outcome
+                                    if notes:
+                                        healthcare_ctx.notes.append(notes)
+                                    print(f"[Server] Captured end_call outcome: {outcome}")
+                            elif tc.get("name") == "request_reschedule":
+                                args = tc.get("args", {})
+                                healthcare_ctx = session_data.get("healthcare_context")
+                                if healthcare_ctx:
+                                    healthcare_ctx.outcome = "reschedule_requested"
+                                    healthcare_ctx.preferred_date = args.get("preferred_date", "")
+                                    healthcare_ctx.preferred_time = args.get("preferred_time", "")
+                                    healthcare_ctx.reschedule_reason = args.get("reason", "")
+                                    print(f"[Server] Captured reschedule: {healthcare_ctx.preferred_date} at {healthcare_ctx.preferred_time}")
+                            elif tc.get("name") == "confirm_appointment":
+                                healthcare_ctx = session_data.get("healthcare_context")
+                                if healthcare_ctx:
+                                    healthcare_ctx.outcome = "confirmed"
+                                    print(f"[Server] Captured confirmation")
+
                 latency = (time_module.time() - start_time) * 1000
                 print(f"[LATENCY] Agent (LangGraph): {latency:.0f}ms")
 
                 # Check if we should end the call after this response
-                if response and should_end_call(response):
+                healthcare_ctx = session_data.get("healthcare_context")
+                should_end = healthcare_ctx and healthcare_ctx.outcome in ["confirmed", "reschedule_requested", "declined", "transferred"]
+                if response and (should_end or should_end_call(response)):
                     session_data["should_hangup"] = True
                     print(f"[Agent] Will hang up after: '{response}'")
                     word_count = len(response.split())
