@@ -430,6 +430,7 @@ def create_app() -> FastAPI:
                                 healthcare_ctx = session_data.get("healthcare_context")
                                 if healthcare_ctx:
                                     healthcare_ctx.outcome = outcome
+                                    healthcare_ctx.ended = True  # Mark call as ended
                                     if notes:
                                         healthcare_ctx.notes.append(notes)
                                     print(f"[Server] Captured end_call outcome: {outcome}")
@@ -452,9 +453,10 @@ def create_app() -> FastAPI:
                 print(f"[LATENCY] Agent (LangGraph): {latency:.0f}ms")
 
                 # Check if we should end the call after this response
+                # Only hang up when end_call tool is explicitly called, not just when outcome is set
                 healthcare_ctx = session_data.get("healthcare_context")
-                should_end = healthcare_ctx and healthcare_ctx.outcome in ["confirmed", "reschedule_requested", "declined", "transferred"]
-                if response and (should_end or should_end_call(response)):
+                end_call_triggered = healthcare_ctx and healthcare_ctx.ended  # Only true when end_call tool is called
+                if response and (end_call_triggered or should_end_call(response)):
                     session_data["should_hangup"] = True
                     print(f"[Agent] Will hang up after: '{response}'")
                     word_count = len(response.split())

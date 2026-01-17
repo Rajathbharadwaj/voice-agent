@@ -346,6 +346,7 @@ class InteractivePipeline:
         """
         self._running = True
         self._input_done = False
+        self._last_audio_activity_time = 0  # Track when audio above threshold was last received
 
         # Start background tasks
         stt_task = asyncio.create_task(self._stt_loop())
@@ -398,6 +399,10 @@ class InteractivePipeline:
 
                     # Get adaptive threshold
                     threshold = get_adaptive_threshold(audio_levels)
+
+                    # Track audio activity (for "are you still there?" suppression)
+                    if rms > threshold:
+                        self._last_audio_activity_time = current_time
 
                     # Skip VAD during greeting cooldown (prevents echo triggering)
                     in_cooldown = self._greeting_cooldown_until > 0 and current_time < self._greeting_cooldown_until
@@ -617,6 +622,15 @@ class InteractivePipeline:
                     # Only start counting silence AFTER agent stops speaking
                     if last_agent_spoke_time == 0:
                         # Agent just finished speaking, start the timer now
+                        last_agent_spoke_time = current_time
+                        continue
+
+                    # Check if there's been recent audio activity (user might be mid-speech)
+                    # If audio above threshold was received within 500ms, user is actively speaking
+                    AUDIO_ACTIVITY_THRESHOLD = 0.5  # 500ms - if audio received this recently, user is talking
+                    time_since_audio = current_time - self._last_audio_activity_time if self._last_audio_activity_time > 0 else float('inf')
+                    if time_since_audio < AUDIO_ACTIVITY_THRESHOLD:
+                        # User is actively speaking, don't interrupt - reset the timer
                         last_agent_spoke_time = current_time
                         continue
 
