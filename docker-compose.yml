@@ -6,7 +6,7 @@ services:
   langgraph-redis:
     image: redis:6
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
       test: redis-cli ping
       interval: 5s
@@ -16,7 +16,7 @@ services:
   langgraph-postgres:
     image: postgres:16
     ports:
-      - "5433:5432"
+      - "5434:5432"
     environment:
       POSTGRES_DB: postgres
       POSTGRES_USER: postgres
@@ -33,7 +33,7 @@ services:
   langgraph-api:
     image: langchain/langgraph-api:latest
     ports:
-      - "8123:8000"
+      - "8124:8000"
     depends_on:
       langgraph-redis:
         condition: service_healthy

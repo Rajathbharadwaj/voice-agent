@@ -53,6 +53,7 @@ def make_call(
     provider_name: str = None,
     clinic_name: str = None,
     appointment_type: str = None,
+    new_thread: bool = False,
 ):
     """
     Make a healthcare reminder call to a patient.
@@ -77,6 +78,8 @@ def make_call(
         params['provider_name'] = provider_name
     if appointment_type:
         params['appointment_type'] = appointment_type
+    if new_thread:
+        params['new_thread'] = 'true'
 
     # URL encode the parameters
     query_string = urlencode(params) if params else ""
@@ -142,6 +145,7 @@ Note: Make sure to start the server with AGENT_MODE=healthcare:
     parser.add_argument('--clinic', '-c', help='Clinic name')
     parser.add_argument('--type', dest='appt_type', help='Appointment type (e.g., "Annual checkup")')
     parser.add_argument('--csv', default='patients_appointments.csv', help='CSV file with patients')
+    parser.add_argument('--new-thread', action='store_true', help='Force a new LangGraph thread (ignore existing SMS thread)')
 
     args = parser.parse_args()
 
@@ -183,6 +187,7 @@ Note: Make sure to start the server with AGENT_MODE=healthcare:
                 provider_name=patient['provider_name'],
                 clinic_name=patient['clinic_name'],
                 appointment_type=patient['appointment_type'],
+                new_thread=args.new_thread,
             )
         else:
             print(f"Error: Index {index} out of range. Use --list to see available patients.")
@@ -203,6 +208,7 @@ Note: Make sure to start the server with AGENT_MODE=healthcare:
             provider_name=args.provider,
             clinic_name=args.clinic,
             appointment_type=args.appt_type,
+            new_thread=args.new_thread,
         )
     else:
         print(f"Error: '{args.target}' is not a valid index or phone number.")

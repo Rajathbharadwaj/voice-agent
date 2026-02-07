@@ -344,10 +344,9 @@ def request_reschedule(
 
         sms_message = (
             f"Hi {context.patient_name},\n\n"
-            f"We've received your request to reschedule your appointment with {context.provider_name}.\n\n"
-            f"Preferred time: {preferred_date} at {preferred_time}\n\n"
-            f"Our scheduling team will contact you within 24 hours to confirm your new appointment.\n\n"
-            f"Questions? Call us at 555-0123\n\n"
+            f"Your appointment with {context.provider_name} has been rescheduled.\n\n"
+            f"New time: {preferred_date} at {preferred_time}\n\n"
+            f"We look forward to seeing you!\n\n"
             f"- {context.clinic_name}"
         )
 
@@ -357,7 +356,7 @@ def request_reschedule(
     except Exception as e:
         print(f"[Healthcare] SMS error: {e}")
 
-    return f"Reschedule request recorded. Preference: {preferred_date} at {preferred_time}. Our team will call back within 24 hours."
+    return f"Appointment rescheduled to {preferred_date} at {preferred_time}. You can now offer to send them a check-in link if the appointment is within the next 2 weeks."
 
 
 @tool
@@ -385,8 +384,8 @@ def send_appointment_sms(config: RunnableConfig = None) -> str:
 {context.appointment_date} at {context.appointment_time}
 {context.provider_name}
 
-123 Medical Center Dr, Suite 200
-Free parking in Lot B
+1500 East Duarte Road, Duarte, CA 91010
+Complimentary valet and self-parking available
 
 Please bring:
 - Photo ID
@@ -395,7 +394,7 @@ Please bring:
 
 Arrive 15 minutes early for check-in.
 
-Questions? Reply to this message or call 555-0123"""
+Questions? Reply to this message."""
 
         twilio.send_sms(context.phone_number, sms_message)
         context.notes.append("Appointment details SMS sent")
@@ -423,9 +422,9 @@ def provide_clinic_info(config: RunnableConfig = None) -> str:
         return "Error: No active call context"
 
     clinic_info = f"""
-{context.clinic_name} is located at 123 Medical Center Dr, Suite 200.
+{context.clinic_name} is located at 1500 East Duarte Road, Duarte, California.
 
-Parking: Free parking is available in Lot B, just behind the building.
+Parking: Complimentary valet and self-parking are available.
 
 Please bring:
 - A photo ID
@@ -583,6 +582,50 @@ def get_appointment_details(config: RunnableConfig = None) -> str:
 
 
 @tool
+def send_checkin_link(config: RunnableConfig = None) -> str:
+    """
+    Send a check-in link to the patient via SMS while still on the call.
+
+    Call this when the patient agrees to check in now (e.g., after rescheduling
+    or confirming an appointment). The link lets them complete pre-visit
+    check-in (verify info, pay copay, etc.) on their phone.
+
+    This does NOT end the call. Stay on the line and wait for them to confirm
+    they've completed the check-in.
+
+    Returns:
+        Confirmation that the check-in link was sent
+    """
+    context = _get_context_from_config(config)
+    if not context:
+        return "Error: No active call context"
+
+    try:
+        TwilioClient = _get_twilio_client()
+        twilio = TwilioClient()
+
+        checkin_url = os.environ.get("CHECKIN_URL", "https://demo-peh.ikshealth.com/?appointmentId=ONY-109555APT000683196")
+
+        sms_message = (
+            f"Hi {context.patient_name},\n\n"
+            f"Please complete your pre-visit check-in using the link below:\n\n"
+            f"{checkin_url}\n\n"
+            f"This only takes about 2 minutes. Verify your information and complete any outstanding items.\n\n"
+            f"- {context.clinic_name}"
+        )
+
+        twilio.send_sms(context.phone_number, sms_message)
+        context.notes.append("Check-in link SMS sent during call")
+        print(f"[Healthcare] Check-in link sent to {context.phone_number}: {checkin_url}")
+
+        return "Check-in link sent successfully. The patient should receive it on their phone now. Stay on the call and wait for them to confirm they've completed it."
+
+    except Exception as e:
+        print(f"[Healthcare] Check-in link SMS error: {e}")
+        return "I wasn't able to send the check-in link right now, but we can send it after the call."
+
+
+@tool
 def end_call(
     outcome: str,
     notes: Optional[str] = None,
@@ -613,7 +656,7 @@ def end_call(
 
     valid_outcomes = [
         "confirmed", "reschedule_requested", "declined",
-        "no_answer", "voicemail", "transferred"
+        "no_answer", "voicemail", "transferred", "switched_to_sms"
     ]
 
     if outcome not in valid_outcomes:
@@ -631,14 +674,192 @@ def end_call(
     return f"Call ended with outcome: {outcome}"
 
 
-# Export all healthcare tools
-HEALTHCARE_TOOLS = [
-    get_appointment_details,  # Agent should call this first to know who they're talking to
+@tool
+def switch_to_sms(
+    config: RunnableConfig = None,
+) -> str:
+    """
+    Switch from the current voice call to SMS/text messaging.
+
+    Call this when the patient asks to continue via text instead of phone
+    (e.g., "can you text me instead?", "I'm in a meeting, text me",
+    "I prefer texting").
+
+    This tool sends an introductory SMS and ends the voice call.
+    The patient can reply to the SMS to continue the conversation
+    with all previous context preserved.
+
+    Returns:
+        Confirmation that SMS was sent and instructions to say goodbye
+    """
+    context = _get_context_from_config(config)
+    if not context:
+        return "Error: No active call context"
+
+    try:
+        TwilioClient = _get_twilio_client()
+        twilio = TwilioClient()
+
+        sms_message = (
+            f"Hi {context.patient_name}, this is Sarah from {context.clinic_name}. "
+            f"Switching our conversation to text as you requested. "
+            f"You can reply here anytime about your appointment on "
+            f"{context.appointment_date} at {context.appointment_time}."
+        )
+
+        twilio.send_sms(context.phone_number, sms_message)
+        context.notes.append("Switched from voice to SMS")
+        context.outcome = "switched_to_sms"
+        context.ended = True
+
+        print(f"[Healthcare] Voice->SMS handoff for {context.patient_name}")
+
+        return (
+            "SMS sent successfully. The call will end shortly. "
+            "Say a brief goodbye like 'I've sent you a text. You can reply there anytime. Take care!'"
+        )
+
+    except Exception as e:
+        print(f"[Healthcare] switch_to_sms error: {e}")
+        return "I wasn't able to send the text right now. Let's continue on the phone."
+
+
+@tool
+def end_conversation(
+    outcome: str,
+    notes: Optional[str] = None,
+    config: RunnableConfig = None,
+) -> str:
+    """
+    End the current SMS conversation and record the outcome.
+
+    Call this when the text conversation is ending.
+
+    Args:
+        outcome: The conversation outcome. Must be one of:
+            - "confirmed": Patient confirmed the appointment
+            - "reschedule_requested": Patient requested to reschedule
+            - "declined": Patient declined/cancelled appointment
+            - "transferred": Escalated to human staff
+
+        notes: Optional notes about the conversation
+
+    Returns:
+        Confirmation that the conversation has ended
+    """
+    context = _get_context_from_config(config)
+    if not context:
+        return "Error: No active conversation context"
+
+    valid_outcomes = [
+        "confirmed", "reschedule_requested", "declined",
+        "transferred", "switched_to_voice"
+    ]
+
+    if outcome not in valid_outcomes:
+        outcome = "confirmed" if context.outcome == "confirmed" else "declined"
+
+    context.outcome = outcome
+    context.ended = True
+    if notes:
+        context.notes.append(notes)
+
+    print(f"[Healthcare SMS] Conversation ended for {context.patient_name}: {outcome}")
+    if context.notes:
+        print(f"[Healthcare SMS] Notes: {context.notes}")
+
+    return f"Conversation ended with outcome: {outcome}"
+
+
+@tool
+def switch_to_voice(
+    config: RunnableConfig = None,
+) -> str:
+    """
+    Switch from SMS to a voice call with the patient.
+
+    Call this when the patient texts something like "can you call me?",
+    "I'd rather talk on the phone", or "this is hard to explain by text".
+
+    This tool initiates an outbound voice call to the patient's phone number.
+    The voice call will have access to the full conversation history.
+
+    Returns:
+        Confirmation that the call is being initiated
+    """
+    context = _get_context_from_config(config)
+    if not context:
+        return "Error: No active conversation context"
+
+    voice_server_url = os.environ.get("VOICE_SERVER_URL", "http://localhost:8080")
+
+    try:
+        import httpx
+
+        payload = {
+            "phone": context.phone_number,
+            "patient_name": context.patient_name,
+            "appointment_date": context.appointment_date,
+            "appointment_time": context.appointment_time,
+            "provider_name": context.provider_name,
+            "clinic_name": context.clinic_name,
+            "appointment_type": context.appointment_type,
+        }
+
+        with httpx.Client(timeout=15.0) as client:
+            response = client.post(
+                f"{voice_server_url}/voice/initiate",
+                json=payload,
+            )
+            response.raise_for_status()
+            result = response.json()
+
+        if result.get("status") == "error":
+            error_msg = result.get("message", "unknown error")
+            if error_msg == "call_already_active":
+                return "There's already an active call with this patient."
+            return f"I wasn't able to start the call: {error_msg}. Let's continue via text."
+
+        context.notes.append(f"Switched from SMS to voice (call SID: {result.get('call_sid', 'unknown')})")
+        context.outcome = "switched_to_voice"
+
+        print(f"[Healthcare] SMS->Voice handoff for {context.patient_name}, call SID: {result.get('call_sid')}")
+
+        return (
+            "Call is being initiated. The patient should receive a call momentarily. "
+            "Reply: 'I'm calling you now! You should receive a call from us in a moment.'"
+        )
+
+    except Exception as e:
+        print(f"[Healthcare] switch_to_voice error: {e}")
+        return "I wasn't able to start a call right now. Let's continue here via text."
+
+
+# Shared tools used by both voice and SMS agents
+_SHARED_TOOLS = [
+    get_appointment_details,
     confirm_appointment,
-    check_reschedule_availability,  # Check calendar before offering reschedule times
+    check_reschedule_availability,
     request_reschedule,
-    send_appointment_sms,
     provide_clinic_info,
+]
+
+# Voice-specific tools
+HEALTHCARE_VOICE_TOOLS = _SHARED_TOOLS + [
+    send_appointment_sms,
+    send_checkin_link,
     transfer_to_staff,
+    switch_to_sms,
     end_call,
 ]
+
+# SMS-specific tools
+HEALTHCARE_SMS_TOOLS = _SHARED_TOOLS + [
+    send_appointment_sms,
+    send_checkin_link,
+    switch_to_voice,
+    end_conversation,
+]
+
+# Legacy alias
+HEALTHCARE_TOOLS = HEALTHCARE_VOICE_TOOLS

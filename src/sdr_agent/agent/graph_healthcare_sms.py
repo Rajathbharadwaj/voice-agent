@@ -1,14 +1,13 @@
 """
-LangGraph Healthcare Agent Graph
+LangGraph Healthcare SMS Agent Graph
 
-Exports a compiled LangGraph StateGraph for healthcare appointment reminders.
-Uses the same architecture as the sales agent but with healthcare-specific
-prompts and tools.
+Same architecture as the voice healthcare agent but with an SMS-adapted prompt.
+Uses the same tools (they're channel-agnostic via config.configurable).
 """
 
 import os
 from dotenv import load_dotenv
-load_dotenv()  # Load .env before reading LLM_MODEL
+load_dotenv()
 import sys
 import importlib.util
 from datetime import datetime, timedelta
@@ -33,12 +32,12 @@ def _load_module_direct(module_name: str, file_path: Path):
 # Get the directory containing this file
 _this_dir = Path(__file__).parent
 
-# Load healthcare prompts and tools directly
-_prompts = _load_module_direct("_healthcare_prompts", _this_dir / "prompts_healthcare.py")
-_tools = _load_module_direct("_healthcare_tools", _this_dir / "tools_healthcare.py")
+# Load SMS prompts and healthcare tools directly
+_prompts = _load_module_direct("_healthcare_sms_prompts", _this_dir / "prompts_healthcare_sms.py")
+_tools = _load_module_direct("_healthcare_sms_tools", _this_dir / "tools_healthcare.py")
 
-HEALTHCARE_SYSTEM_PROMPT = _prompts.HEALTHCARE_SYSTEM_PROMPT
-HEALTHCARE_VOICE_TOOLS = _tools.HEALTHCARE_VOICE_TOOLS
+HEALTHCARE_SMS_SYSTEM_PROMPT = _prompts.HEALTHCARE_SMS_SYSTEM_PROMPT
+HEALTHCARE_SMS_TOOLS = _tools.HEALTHCARE_SMS_TOOLS
 
 
 def build_system_prompt(config: dict = None) -> str:
@@ -70,7 +69,7 @@ def build_system_prompt(config: dict = None) -> str:
         if patient_name:
             appointment_context = f"""
 
-## CURRENT CALL - APPOINTMENT DETAILS
+## CURRENT CONVERSATION - APPOINTMENT DETAILS
 **Patient:** {patient_name}
 **Appointment Date:** {cfg.get('appointment_date', 'Not specified')}
 **Appointment Time:** {cfg.get('appointment_time', 'Not specified')}
@@ -80,14 +79,13 @@ def build_system_prompt(config: dict = None) -> str:
 
 CRITICAL: You KNOW these appointment details. Reference them confidently when the patient asks."""
 
-    return f"{HEALTHCARE_SYSTEM_PROMPT}\n\n{calendar_context}{appointment_context}"
+    return f"{HEALTHCARE_SMS_SYSTEM_PROMPT}\n\n{calendar_context}{appointment_context}"
 
 
-# Initialize model - configurable via LLM_MODEL env var
-# Examples: "openai:gpt-5.2", "anthropic:claude-opus-4-5-20251101", "anthropic:claude-sonnet-4-5-20250929"
+# Initialize model
 DEFAULT_MODEL = "anthropic:claude-opus-4-5-20251101"
 LLM_MODEL = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
-print(f"[LangGraph Healthcare] Using model: {LLM_MODEL}")
+print(f"[LangGraph Healthcare SMS] Using model: {LLM_MODEL}")
 
 model = init_chat_model(
     model=LLM_MODEL,
@@ -95,18 +93,14 @@ model = init_chat_model(
 )
 
 # Bind healthcare tools to the model
-model_with_tools = model.bind_tools(HEALTHCARE_VOICE_TOOLS)
+model_with_tools = model.bind_tools(HEALTHCARE_SMS_TOOLS)
 
 
 def should_continue(state: MessagesState) -> str:
     """Determine if we should continue to tools or end."""
     last_message = state["messages"][-1]
-
-    # If the last message has tool calls, route to tools
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         return "tools"
-
-    # Otherwise, end
     return END
 
 
@@ -128,16 +122,11 @@ def call_model(state: MessagesState, config: dict = None) -> dict:
 # Build the graph
 builder = StateGraph(MessagesState)
 
-# Add nodes
 builder.add_node("agent", call_model)
-builder.add_node("tools", ToolNode(HEALTHCARE_VOICE_TOOLS))
+builder.add_node("tools", ToolNode(HEALTHCARE_SMS_TOOLS))
 
-# Add edges
 builder.add_edge(START, "agent")
 builder.add_conditional_edges("agent", should_continue)
 builder.add_edge("tools", "agent")
 
-# Compile the graph
-# Note: When running via LangGraph Platform (langgraph up), checkpointer is
-# automatically configured from POSTGRES_URI environment variable
 graph = builder.compile()

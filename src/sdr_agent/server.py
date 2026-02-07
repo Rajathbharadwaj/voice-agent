@@ -6,6 +6,7 @@ Uses LangGraph Platform for agent execution.
 """
 
 import asyncio
+import csv
 import os
 from typing import Optional
 from dotenv import load_dotenv
@@ -33,6 +34,46 @@ LANGGRAPH_URL = os.environ.get("LANGGRAPH_URL", "http://localhost:8123")
 
 # Agent mode: "sales" or "healthcare"
 AGENT_MODE = os.environ.get("AGENT_MODE", "sales")
+
+# Shared phone→LangGraph thread_id mapping (voice calls + SMS share threads)
+_phone_threads: dict[str, str] = {}
+
+
+def _normalize_phone(phone: str) -> str:
+    """Normalize phone number to E.164 for consistent lookup."""
+    phone = phone.strip()
+    # Remove all non-digit chars except leading +
+    if phone.startswith("+"):
+        return "+" + "".join(c for c in phone[1:] if c.isdigit())
+    digits = "".join(c for c in phone if c.isdigit())
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return f"+{digits}"
+
+
+def _load_patients_csv() -> list[dict]:
+    """Load patients from CSV file."""
+    csv_path = os.path.join(os.path.dirname(__file__), "..", "..", "patients_appointments.csv")
+    csv_path = os.path.normpath(csv_path)
+    if not os.path.exists(csv_path):
+        # Try current working directory
+        csv_path = "patients_appointments.csv"
+    try:
+        with open(csv_path, newline="") as f:
+            return list(csv.DictReader(f))
+    except FileNotFoundError:
+        return []
+
+
+def _find_patient_by_phone(phone: str) -> Optional[dict]:
+    """Find a patient by phone number from the CSV."""
+    normalized = _normalize_phone(phone)
+    for patient in _load_patients_csv():
+        if _normalize_phone(patient.get("phone", "")) == normalized:
+            return patient
+    return None
 
 
 def create_app() -> FastAPI:
@@ -114,6 +155,7 @@ def create_app() -> FastAPI:
         appointment_time = request.query_params.get("appointment_time")
         provider_name = request.query_params.get("provider_name")
         appointment_type = request.query_params.get("appointment_type")
+        new_thread = request.query_params.get("new_thread")
 
         # Generate TwiML for media stream
         websocket_url = f"wss://{request.headers.get('host', 'localhost')}/media-stream"
@@ -132,6 +174,7 @@ def create_app() -> FastAPI:
                 "appointment_time": appointment_time,
                 "provider_name": provider_name,
                 "appointment_type": appointment_type,
+                "new_thread": new_thread,
             }
         )
 
@@ -164,8 +207,11 @@ def create_app() -> FastAPI:
             """Called when media stream starts."""
             session_data["session"] = session
             session_data["call_sid"] = session.call_sid  # Store for hangup
+            session_data["new_thread"] = getattr(session, "new_thread", False)
             print(f"[Server] Call started: {session.call_sid}")
             print(f"[Server] Agent mode: {AGENT_MODE}")
+            if session_data["new_thread"]:
+                print(f"[Server] Force new thread: true")
 
             # Register in active_sessions for webhook access
             if session.call_sid:
@@ -336,23 +382,39 @@ def create_app() -> FastAPI:
                         input_text = f"[Context: You asked 'Am I speaking with the owner or manager?' - you don't know their name yet] {text}"
 
                 # Get or create thread_id for persistent conversation
+                # Check shared mapping first (SMS may have started a thread already)
                 thread_id = session_data.get("thread_id")
                 if not thread_id:
                     session = session_data.get("session")
                     phone = session.to_number if session else None
+                    force_new = session_data.get("new_thread", False)
 
-                    # Always create thread in LangGraph Platform
-                    # For phone calls, we use metadata to track the phone number
-                    thread = await langgraph_client.threads.create(
-                        metadata={"phone": phone} if phone else {}
-                    )
-                    thread_id = thread["thread_id"]
+                    # Check if there's an existing thread from SMS for this phone
+                    if phone and not force_new:
+                        existing_thread = _phone_threads.get(_normalize_phone(phone))
+                        if existing_thread:
+                            thread_id = existing_thread
+                            print(f"[Agent] Reusing existing thread from SMS: {thread_id} (phone: {phone})")
+
+                    if not thread_id:
+                        # Create new thread in LangGraph Platform
+                        thread = await langgraph_client.threads.create(
+                            metadata={"phone": phone} if phone else {}
+                        )
+                        thread_id = thread["thread_id"]
+                        print(f"[Agent] Created new LangGraph thread: {thread_id} (phone: {phone})")
+
                     session_data["thread_id"] = thread_id
-                    print(f"[Agent] Created LangGraph thread: {thread_id} (phone: {phone})")
+                    # Save to shared mapping so SMS/voice can reuse this thread
+                    if phone:
+                        _phone_threads[_normalize_phone(phone)] = thread_id
 
                 # Call LangGraph Platform
                 import time as time_module
                 start_time = time_module.time()
+
+                # Track message count before run so we only scan NEW messages for tool calls
+                prev_msg_count = session_data.get("prev_msg_count", 0)
 
                 # Use runs.wait() for simpler non-streaming response
                 # Add 30 second timeout to prevent hanging
@@ -417,8 +479,12 @@ def create_app() -> FastAPI:
                             if response:
                                 break
 
-                # Check for end_call tool and extract outcome
-                for msg in messages:
+                # Update message count for next run
+                session_data["prev_msg_count"] = len(messages)
+
+                # Check for end_call tool ONLY in new messages from this run
+                new_messages = messages[prev_msg_count:]
+                for msg in new_messages:
                     if isinstance(msg, dict) and msg.get("type") == "ai":
                         tool_calls = msg.get("tool_calls", [])
                         for tc in tool_calls:
@@ -434,6 +500,21 @@ def create_app() -> FastAPI:
                                     if notes:
                                         healthcare_ctx.notes.append(notes)
                                     print(f"[Server] Captured end_call outcome: {outcome}")
+                            elif tc.get("name") == "switch_to_sms":
+                                # Voice->SMS handoff: trigger hangup (same as end_call)
+                                healthcare_ctx = session_data.get("healthcare_context")
+                                if healthcare_ctx:
+                                    healthcare_ctx.outcome = "switched_to_sms"
+                                    healthcare_ctx.ended = True
+                                    print(f"[Server] Captured switch_to_sms handoff")
+                            elif tc.get("name") == "end_conversation":
+                                # SMS tool — capture outcome but do NOT trigger hangup
+                                args = tc.get("args", {})
+                                healthcare_ctx = session_data.get("healthcare_context")
+                                if healthcare_ctx:
+                                    healthcare_ctx.outcome = args.get("outcome", "unknown")
+                                    # Do NOT set ended=True — that triggers hangup
+                                print(f"[Server] WARNING: end_conversation seen in voice context (outcome: {args.get('outcome', 'unknown')})")
                             elif tc.get("name") == "request_reschedule":
                                 args = tc.get("args", {})
                                 healthcare_ctx = session_data.get("healthcare_context")
@@ -494,7 +575,7 @@ def create_app() -> FastAPI:
                 else:
                     # Fallback healthcare greeting
                     patient_name = getattr(session, 'owner_name', None) or "there"
-                    return f"Hi {patient_name}, this is Sarah calling from your healthcare provider about your upcoming appointment. Is this a good time?"
+                    return f"Hi {patient_name}, this is Sarah calling from City of Hope about your upcoming appointment. Is this a good time?"
             else:
                 # Sales greeting
                 if session and session.owner_name:
@@ -513,10 +594,13 @@ def create_app() -> FastAPI:
                 await handler.send_clear(ws, session.stream_sid)
 
         # Create pipeline config with TTS engine from environment
+        # Default to female voice "tara" for healthcare mode (agent is "Sarah")
+        default_voice = "af_sarah" if AGENT_MODE == "healthcare" else "am_adam"
         pipeline_config = PipelineConfig(
             tts_engine=os.getenv("TTS_ENGINE", "comfyui"),
+            tts_voice=os.getenv("TTS_VOICE", default_voice),
         )
-        print(f"[Server] Using TTS engine: {pipeline_config.tts_engine}")
+        print(f"[Server] Using TTS engine: {pipeline_config.tts_engine}, voice: {pipeline_config.tts_voice}")
 
         audio_processor = create_audio_processor(
             agent_handler=agent_handler,
@@ -546,6 +630,89 @@ def create_app() -> FastAPI:
 
         return PlainTextResponse("OK")
 
+    @app.post("/voice/initiate")
+    async def voice_initiate(request: Request):
+        """
+        Internal API to initiate an outbound voice call.
+        Called by the switch_to_voice tool running in LangGraph Platform.
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return {"status": "error", "message": "Invalid JSON"}
+
+        phone = data.get("phone")
+        patient_name = data.get("patient_name")
+        appointment_date = data.get("appointment_date")
+        appointment_time = data.get("appointment_time")
+        provider_name = data.get("provider_name")
+        clinic_name = data.get("clinic_name")
+        appointment_type = data.get("appointment_type")
+
+        if not phone:
+            return {"status": "error", "message": "phone is required"}
+
+        # Check if there's already an active call for this phone
+        normalized = _normalize_phone(phone)
+        for sid, sess in active_sessions.items():
+            session = sess.get("session")
+            if session and session.to_number and _normalize_phone(session.to_number) == normalized:
+                return {"status": "error", "message": "call_already_active", "call_sid": sid}
+
+        # Get ngrok URL
+        import subprocess, json as json_mod
+        try:
+            result = subprocess.run(
+                ['curl', '-s', 'localhost:4040/api/tunnels'],
+                capture_output=True, text=True, timeout=5
+            )
+            tunnels = json_mod.loads(result.stdout)
+            ngrok_url = tunnels['tunnels'][0]['public_url']
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to get ngrok URL: {e}"}
+
+        # Build webhook URL with patient context
+        from urllib.parse import urlencode
+        params = {}
+        if patient_name:
+            params['owner_name'] = patient_name
+        if clinic_name:
+            params['business_name'] = clinic_name
+        if appointment_date:
+            params['appointment_date'] = appointment_date
+        if appointment_time:
+            params['appointment_time'] = appointment_time
+        if provider_name:
+            params['provider_name'] = provider_name
+        if appointment_type:
+            params['appointment_type'] = appointment_type
+
+        query_string = urlencode(params) if params else ""
+        webhook_url = f"{ngrok_url}/voice/outbound"
+        if query_string:
+            webhook_url += f"?{query_string}"
+
+        # Initiate call via Twilio
+        try:
+            from twilio.rest import Client as TwilioRestClient
+            twilio_config = config
+            twilio_client = TwilioRestClient(
+                twilio_config.twilio_account_sid,
+                twilio_config.twilio_auth_token,
+            )
+            call = twilio_client.calls.create(
+                url=webhook_url,
+                to=phone,
+                from_=twilio_config.twilio_phone_number,
+                status_callback=f'{ngrok_url}/voice/status',
+                status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+            )
+            print(f"[Server] Voice initiate: call {call.sid} to {phone}")
+            return {"status": "ok", "call_sid": call.sid}
+        except Exception as e:
+            print(f"[Server] Voice initiate error: {e}")
+            return {"status": "error", "message": str(e)}
+
     @app.post("/recording-status")
     async def recording_status(request: Request):
         """Handle recording status callbacks."""
@@ -567,6 +734,117 @@ def create_app() -> FastAPI:
                 )
 
         return PlainTextResponse("OK")
+
+    # =====================================================
+    # SMS Inbound (Twilio webhook for patient text replies)
+    # =====================================================
+
+    @app.post("/sms/inbound")
+    async def sms_inbound(request: Request):
+        """
+        Handle inbound SMS from Twilio.
+
+        When a patient texts the Twilio number, this endpoint:
+        1. Looks up the patient from CSV by phone number
+        2. Gets or creates a LangGraph thread (reuses voice call thread if exists)
+        3. Sends the message to the healthcare agent
+        4. Returns the agent's response as an SMS reply via TwiML
+        """
+        form = await request.form()
+        from_number = form.get("From", "")
+        body = form.get("Body", "").strip()
+        message_sid = form.get("MessageSid", "")
+
+        print(f"[SMS] Inbound from {from_number}: '{body}' (SID: {message_sid})")
+
+        if not body:
+            from twilio.twiml.messaging_response import MessagingResponse
+            resp = MessagingResponse()
+            return Response(content=str(resp), media_type="application/xml")
+
+        # Look up patient from CSV
+        patient = _find_patient_by_phone(from_number)
+        if patient:
+            print(f"[SMS] Found patient: {patient.get('patient_name')} - {patient.get('appointment_date')}")
+        else:
+            print(f"[SMS] No patient found for {from_number}, proceeding without context")
+
+        # Get or create LangGraph thread for this phone number
+        langgraph_client = get_client(url=LANGGRAPH_URL)
+        normalized_phone = _normalize_phone(from_number)
+        thread_id = _phone_threads.get(normalized_phone)
+
+        if thread_id:
+            print(f"[SMS] Reusing existing thread: {thread_id}")
+        else:
+            thread = await langgraph_client.threads.create(
+                metadata={"phone": from_number, "channel": "sms"}
+            )
+            thread_id = thread["thread_id"]
+            _phone_threads[normalized_phone] = thread_id
+            print(f"[SMS] Created new thread: {thread_id}")
+
+        # Build config metadata (same as voice call flow)
+        config_metadata = {"phone_number": from_number}
+        if patient:
+            config_metadata.update({
+                "patient_name": patient.get("patient_name", ""),
+                "appointment_date": patient.get("appointment_date", ""),
+                "appointment_time": patient.get("appointment_time", ""),
+                "provider_name": patient.get("provider_name", ""),
+                "clinic_name": patient.get("clinic_name", ""),
+                "appointment_type": patient.get("appointment_type", ""),
+            })
+
+        # Use SMS-specific agent (different prompt, same tools)
+        agent_id = "healthcare_sms_agent" if AGENT_MODE == "healthcare" else "sales_agent"
+
+        # Call LangGraph agent
+        try:
+            result = await asyncio.wait_for(
+                langgraph_client.runs.wait(
+                    thread_id,
+                    agent_id,
+                    input={"messages": [{"role": "human", "content": body}]},
+                    config={"configurable": config_metadata},
+                ),
+                timeout=30.0,
+            )
+
+            # Extract the last AI message
+            response_text = ""
+            messages = result.get("messages", [])
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("type") == "ai":
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        response_text = content
+                        break
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                response_text = block.get("text", "")
+                                break
+                        if response_text:
+                            break
+
+            print(f"[SMS] Agent response: '{response_text[:100]}...'")
+
+        except asyncio.TimeoutError:
+            print(f"[SMS] Agent timeout for {from_number}")
+            response_text = "Sorry, I'm taking longer than expected. Please try again in a moment."
+        except Exception as e:
+            print(f"[SMS] Agent error: {e}")
+            import traceback
+            traceback.print_exc()
+            response_text = "Sorry, I'm having trouble right now. Please call us directly for assistance."
+
+        # Return TwiML response with the agent's reply
+        from twilio.twiml.messaging_response import MessagingResponse
+        twiml_response = MessagingResponse()
+        twiml_response.message(response_text or "Sorry, I couldn't process your message. Please try again.")
+
+        return Response(content=str(twiml_response), media_type="application/xml")
 
     # =====================================================
     # Booking Webhook (from CUA app)

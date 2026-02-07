@@ -114,6 +114,7 @@ class MediaStreamHandler:
                         session.appointment_time = custom_params.get("appointment_time")
                         session.provider_name = custom_params.get("provider_name")
                         session.appointment_type = custom_params.get("appointment_type")
+                        session.new_thread = custom_params.get("new_thread") in ("true", "True", "1")
 
                         print(f"[MediaStream] Stream started: {session.stream_sid}")
 
